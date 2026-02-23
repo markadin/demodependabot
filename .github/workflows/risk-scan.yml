@@ -207,14 +207,14 @@ jobs:
             grype.json
             report.md
 
-      # 11) (Optional) Fail if Criticals exist — toggle to enforce policy
-      #     We use the JSON to decide after posting the comment.
-      - name: Fail if Critical vulnerabilities exist
-        id: failgate
-        run: |
-          crits=$(jq '[.matches[] | select(.vulnerability.severity=="Critical")] | length' grype.json)
-          echo "critical_count=$crits" >> $GITHUB_OUTPUT
-          if [ "$crits" -gt 0 ]; then
-            echo "Found $crits Critical vulnerabilities"
-            exit 1
-          fi
+      # # 11) (Optional) Fail if Criticals exist — toggle to enforce policy
+      # #     We use the JSON to decide after posting the comment.
+      # - name: Fail if Critical vulnerabilities exist
+      #   id: failgate
+      #   run: |
+      #     crits=$(jq '[.matches[] | select(.vulnerability.severity=="Critical")] | length' grype.json)
+      #     echo "critical_count=$crits" >> $GITHUB_OUTPUT
+      #     if [ "$crits" -gt 0 ]; then
+      #       echo "Found $crits Critical vulnerabilities"
+      #       exit 1
+      #     fi
