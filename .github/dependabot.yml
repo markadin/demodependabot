@@ -1,15 +1,66 @@
 ---
 version: 2
 updates:
+  ########################################################
+  # 1) GitHub Actions dependency updates (weekly)
+  ########################################################
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
-  - package-ecosystem: npm
+
+    # Group all GitHub Action updates into one PR
+    groups:
+      github-actions-all:
+        patterns:
+          - "*"
+
+    # Optional ignore block 
+    # ignore:
+    #   - dependency-name: "actions/checkout"
+    #   - dependency-name: "actions/setup-node"
+    #   - dependency-name: "actions/cache"
+    #   - dependency-name: "some/action-you-want-to-freeze"
+
+
+  ########################################################
+  # 2) npm dependency updates (weekly, in /javascript)
+  ########################################################
+  - package-ecosystem: "npm"
     directory: "/javascript"
     schedule:
       interval: "weekly"
-  - package-ecosystem: bundler
+
+    # Group all npm updates into one PR
+    groups:
+      npm-all:
+        patterns:
+          - "*"
+
+    # Optional ignore block
+    # ignore:
+    #   - dependency-name: "react"              # example of excluding risky deps
+    #   - dependency-name: "webpack"
+    #   - dependency-name: "express"
+    #   - dependency-name: "hot-formula-parser" # freeze specific SOUP
+
+
+  ########################################################
+  # 3) Ruby bundler (Gemfile) dependency updates
+  ########################################################
+  - package-ecosystem: "bundler"
     directory: "/ruby"
     schedule:
       interval: "weekly"
+
+    # Group all bundler updates into one PR
+    groups:
+      bundler-all:
+        patterns:
+          - "*"
+
+    # Optional ignore block 
+    # ignore:
+    #   - dependency-name: "rails"
+    #   - dependency-name: "nokogiri"
+    #   - dependency-name: "puma"
