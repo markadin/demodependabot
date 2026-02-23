@@ -1,0 +1,47 @@
+name: Dependency Risk Scan
+
+on:
+  pull_request:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 1. Install Syft to generate SBOM
+      - name: Install Syft
+        uses: anchore/syft-action@v0.13.0
+
+      # 2. Generate SBOM
+      - name: Generate SBOM
+        run: syft dir:. -o cyclonedx-json > sbom.json
+
+      # 3. Install Grype
+      - name: Install Grype
+        uses: anchore/grype-action@v0.4.0
+
+      # 4. Run Grype scan
+      - name: Scan SBOM with Grype
+        run: grype sbom:sbom.json -o table | tee grype-report.txt
+
+      # 5. Post Grype scan result as PR comment  ← ADD HERE
+      - name: Comment vulnerability report on PR
+        uses: mshick/add-pr-comment@v2
+        with:
+          message: |
+            ## 🔍 Dependency Risk Report (Grype)
+            ```
+            $(cat grype-report.txt)
+            ```
+
+      # 6. (Optional) Upload artifacts
+      - name: Upload SBOM & Grype result
+        uses: actions/upload-artifact@v4
+        with:
+          name: grype-results
+          path: |
+            sbom.json
+            grype-report.txt
