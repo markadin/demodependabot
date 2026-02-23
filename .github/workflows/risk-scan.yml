@@ -78,14 +78,14 @@ jobs:
       # ------------------------------
       - name: Build vulnerability summary
         run: |
-          jq '
-            [.matches[].vulnerability.severity] 
-            | group_by(.) 
-            | map({severity: .[0], count: length}) 
+          jq "
+            [.matches[].vulnerability.severity]
+            | group_by(.)
+            | map({severity: .[0], count: length})
             | sort_by(.severity)
             | reverse
-          ' grype.json > /tmp/severity_counts.json
-
+          " grype.json > /tmp/severity_counts.json
+      
           echo "## 🧮 Severity Summary" > severity.md
           echo "| Severity | Count |" >> severity.md
           echo "|---|---:|" >> severity.md
@@ -93,20 +93,20 @@ jobs:
 
       - name: Extract critical vulnerabilities
         run: |
-          jq '
+          jq "
             [.matches[]
-              | select(.vulnerability.severity=="Critical")
+              | select(.vulnerability.severity==\"Critical\")
               | {
                   pkg: .artifact.name,
                   version: .artifact.version,
                   vuln: .vulnerability.id,
-                  fix: (.vulnerability.fix.versions[0] // "-")
+                  fix: (.vulnerability.fix.versions[0] // \"-\")
                 }
             ]
-          ' grype.json > /tmp/critical_list.json
-
+          " grype.json > /tmp/critical_list.json
+      
           echo "## ❗ Critical Vulnerabilities" > critical.md
-          if [ "$(jq 'length' /tmp/critical_list.json')" -eq 0 ]; then
+          if [ "$(jq 'length' /tmp/critical_list.json)" -eq 0 ]; then
             echo "_No Critical vulnerabilities found._" >> critical.md
           else
             echo "| Package | Version | Vulnerability | Fix |" >> critical.md
@@ -124,21 +124,21 @@ jobs:
           echo "" >> sbom.md
           echo "| Component | Version | License |" >> sbom.md
           echo "|---|---|---|" >> sbom.md
-
-          jq '
-            (.components // []) |
-            map({
-              name: (.name // "-"),
-              version: (.version // "-"),
-              license: (
-                ( .licenses[0].license.name ) //
-                ( .licenses[0].expression ) //
-                "-"
-              )
-            }) |
-            unique_by(.name + ":" + .version) |
-            .[0:100]
-          ' sbom.json |
+      
+          jq "
+            (.components // [])
+            | map({
+                name: (.name // \"-\"),
+                version: (.version // \"-\"),
+                license: (
+                  (.licenses[0].license.name) //
+                  (.licenses[0].expression) //
+                  \"-\"
+                )
+              })
+            | unique_by(.name + \":\" + .version)
+            | .[0:100]
+          " sbom.json |
           jq -r '.[] | "| \(.name) | \(.version) | \(.license) |"' >> sbom.md
 
       # ------------------------------
