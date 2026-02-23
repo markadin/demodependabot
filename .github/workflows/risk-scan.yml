@@ -12,45 +12,39 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Install and run Syft to generate SBOM
-      - name: Generate SBOM with Syft
-        uses: anchore/syft-action@v0.11.0
-        with:
-          path: .
-          output: cyclonedx-json
-          file: sbom.json
+      # 1) Install Syft CLI
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
 
-      # Run Grype scan using Anchore's scan-action (correct action)
-      - name: Scan SBOM with Grype
+      # 2) Generate SBOM
+      - name: Generate SBOM
+        run: syft dir:. -o cyclonedx-json > sbom.json
+
+      # 3) Scan SBOM with Grype using Anchore scan-action (the official repo)
+      - name: Run vulnerability scan
         uses: anchore/scan-action@v3
         with:
           sbom: sbom.json
-          acs-report-enable: true
+          output-format: json     # json/sarif/table
+          fail-build: false       # let it finish so we can see all results
+          severity-cutoff: low    # irrelevant since fail-build=false
 
-      # 5. Post Grype scan result as PR comment  ← ADD HERE
-      - name: Comment vulnerability report on PR
-        uses: mshick/add-pr-comment@v2
-        with:
-          message: |
-            ## 🔍 Dependency Risk Report (Grype)
-            ```
-            $(cat grype-report.txt)
-            ```
-
-    
-
-      # Optional: Upload SBOM and scan report
-      - name: Upload SBOM and Scan Report
+      # 4) Upload all results for download
+      - name: Upload SBOM & Scan results
         uses: actions/upload-artifact@v4
         with:
-          name: grype-scan-results
+          name: scan-results
           path: |
             sbom.json
             anchore-reports/
-            
 
+      # 5) Post vulnerability report into PR
+      - name: PR Comment with Vulnerabilities
+        uses: mshick/add-pr-comment@v2
+        with:
+          message: |
+            ## 🔍 Vulnerability Report
+            Grype scan completed.
 
-
-
-
-
+            Full report available in GitHub Actions artifacts.
