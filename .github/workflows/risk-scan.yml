@@ -1,50 +1,220 @@
-name: Dependency Risk Scan
+name: SBOM & Risk Report (PR)
 
 on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
-  scan:
+  sbom_and_risk:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # we need base commit to diff dependency files
 
-      # 1) Install Syft CLI
+      - name: Install jq (for JSON processing)
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      # 1) Install Syft (official Anchore installer)
+      #    Docs: https://oss.anchore.com/docs/installation/syft/
       - name: Install Syft
         run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          curl -sSfL https://get.anchore.io/syft | sudo sh -s -- -b /usr/local/bin
+          syft version
 
-      # 2) Generate SBOM
-      - name: Generate SBOM
+      # 2) Generate SBOM (CycloneDX JSON) for the repo contents
+      - name: Generate SBOM (CycloneDX JSON)
         run: syft dir:. -o cyclonedx-json > sbom.json
 
-      # 3) Scan SBOM with Grype using Anchore scan-action (the official repo)
-      - name: Run vulnerability scan
-        uses: anchore/scan-action@v3
-        with:
-          sbom: sbom.json
-          output-format: json     # json/sarif/table
-          fail-build: false       # let it finish so we can see all results
-          severity-cutoff: low    # irrelevant since fail-build=false
+      # 3) Install Grype (official Anchore installer)
+      #    Docs: https://oss.anchore.com/docs/installation/grype/
+      - name: Install Grype
+        run: |
+          curl -sSfL https://get.anchore.io/grype | sudo sh -s -- -b /usr/local/bin
+          grype version
 
-      # 4) Upload all results for download
-      - name: Upload SBOM & Scan results
-        uses: actions/upload-artifact@v4
-        with:
-          name: scan-results
-          path: |
-            sbom.json
-            anchore-reports/
+      # 4) Run Grype on the SBOM (JSON output for processing + table for logs)
+      - name: Vulnerability scan (Grype)
+        run: |
+          grype sbom:sbom.json -o json > grype.json
+          echo "----- Grype table (truncated) -----"
+          grype sbom:sbom.json -o table | head -n 200 || true
 
-      # 5) Post vulnerability report into PR
-      - name: PR Comment with Vulnerabilities
+      # 5) Build "Updated dependencies" section
+      #    - npm: compare dependencies/devDependencies between base and head
+      #    - generic: list changed dependency files
+      - name: Compute dependency updates
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # Collect changed files that commonly define dependencies
+          git diff --name-only "$BASE_SHA"...HEAD > changed_files.txt
+          DEP_FILES=$(grep -E '(^|/)(package.json|package-lock.json|requirements.txt|poetry.lock|Pipfile.lock|pom.xml|build.gradle|gradle.lockfile|go.mod|go.sum|Gemfile.lock|Cargo.lock|composer.lock)$' changed_files.txt || true)
+
+          echo "## 📦 Updated dependencies" > updates.md
+          if [ -n "$DEP_FILES" ]; then
+            echo "" >> updates.md
+            echo "**Changed dependency files:**" >> updates.md
+            echo "" >> updates.md
+            echo "$DEP_FILES" | sed 's/^/- `/;s/$/`/' >> updates.md
+          else
+            echo "" >> updates.md
+            echo "_No known dependency manifest/lockfile changes detected._" >> updates.md
+          fi
+
+          # npm diff (package.json): show version changes for dependencies + devDependencies
+          if [ -f package.json ]; then
+            git show "$BASE_SHA:package.json" > /tmp/base_package.json 2>/dev/null || true
+            if [ -s /tmp/base_package.json ]; then
+              echo "" >> updates.md
+              echo "**npm changes (dependencies & devDependencies):**" >> updates.md
+              node -e '
+                const fs=require("fs");
+                const safe=(p)=>{ try{return JSON.parse(fs.readFileSync(p,"utf8"))}catch{return{}} }
+                const base=safe("/tmp/base_package.json");
+                const head=safe("package.json");
+                const get = (o) => ({...(o.dependencies||{}), ...(o.devDependencies||{})});
+                const b=get(base), h=get(head);
+                const names=[...new Set([...Object.keys(b),...Object.keys(h)])].sort();
+                const rows=[];
+                for (const n of names) {
+                  const from=b[n]||null, to=h[n]||null;
+                  if (from!==to) rows.push({name:n, from, to});
+                }
+                if (!rows.length){ console.log("_No npm dependency version changes detected._"); process.exit(0); }
+                console.log("| Package | From | To |");
+                console.log("|---|---|---|");
+                for (const r of rows) console.log(`| ${r.name} | ${r.from??"-"} | ${r.to??"-"} |`);
+              ' >> updates.md
+            fi
+          fi
+
+      # 6) Prepare "Critical vulnerabilities" and severity summary
+      - name: Build vulnerability summary + critical table
+        run: |
+          # Severity counts:
+          jq -r '
+            [.matches[].vulnerability.severity] 
+            | group_by(.) 
+            | map({severity: .[0], count: length}) 
+            | sort_by(.severity) 
+            | reverse
+          ' grype.json > /tmp/severity_counts.json
+
+          # Critical details table (pkg, version, CVE, fix)
+          jq -r '
+            [.matches[]
+              | select(.vulnerability.severity=="Critical")
+              | {
+                  pkg: .artifact.name,
+                  version: .artifact.version,
+                  vuln: .vulnerability.id,
+                  fix: (
+                    (.vulnerability.fix.versions[0]) // 
+                    (.vulnerability.fix.state // "-")
+                  )
+                }
+            ]' grype.json > /tmp/critical_list.json
+
+          echo "## ❗ Critical vulnerabilities" > critical.md
+          if [ "$(jq 'length' /tmp/critical_list.json)" -eq 0 ]; then
+            echo "" >> critical.md
+            echo "_No Critical vulnerabilities found._" >> critical.md
+          else
+            echo "" >> critical.md
+            echo "| Package | Version | Vulnerability | Fix available |" >> critical.md
+            echo "|---|---|---|---|" >> critical.md
+            jq -r '.[] | "| \(.pkg) | \(.version) | \(.vuln) | \(.fix) |"' /tmp/critical_list.json >> critical.md
+          fi
+
+          echo "## 🧮 Severity summary" > severity.md
+          if [ "$(jq 'length' /tmp/severity_counts.json)" -eq 0 ]; then
+            echo "" >> severity.md
+            echo "_No vulnerabilities detected._" >> severity.md
+          else
+            echo "" >> severity.md
+            echo "| Severity | Count |" >> severity.md
+            echo "|---|---:|" >> severity.md
+            jq -r '.[] | "| \(.severity) | \(.count) |"' /tmp/severity_counts.json >> severity.md
+          fi
+
+      # 7) Create a nicely formatted SBOM snippet (first 100 components)
+      - name: Build SBOM summary (first 100 components)
+        run: |
+          echo "## 🧾 SBOM (CycloneDX) – first 100 components" > sbom.md
+          echo "" >> sbom.md
+          echo "_Full SBOM attached as artifact (sbom.json)._" >> sbom.md
+          echo "" >> sbom.md
+          echo "| Component | Version | License |" >> sbom.md
+          echo "|---|---|---|" >> sbom.md
+          # Components + best-effort license field
+          jq -r '
+            (.components // []) 
+            | .[0:100]
+            | map({
+                name: (.name // "-"),
+                version: (.version // "-"),
+                license: (
+                  ( .licenses[0].license.name ) // 
+                  ( .licenses[0].expression ) // 
+                  "-"
+                )
+              })
+            | .[]
+            | "| \(.name) | \(.version) | \(.license) |"
+          ' sbom.json >> sbom.md
+
+      # 8) Assemble a single PR comment (Markdown)
+      - name: Assemble PR comment
+        run: |
+          {
+            echo "## 🔒 Dependency Risk Report (SBOM + Grype)"
+            echo ""
+            echo "**PR:** #${{ github.event.pull_request.number }} &middot; **Branch:** \`${{ github.head_ref || github.ref_name }}\`"
+            echo ""
+            cat severity.md
+            echo ""
+            cat critical.md
+            echo ""
+            cat updates.md
+            echo ""
+            echo "<details><summary>Show SBOM (first 100 components)</summary>"
+            echo ""
+            cat sbom.md
+            echo ""
+            echo "</details>"
+          } > report.md
+
+      # 9) Post the comment into the PR
+      - name: Comment on PR
         uses: mshick/add-pr-comment@v2
         with:
-          message: |
-            ## 🔍 Vulnerability Report
-            Grype scan completed.
+          message-path: report.md
 
-            Full report available in GitHub Actions artifacts.
+      # 10) Upload artifacts for audits / Jira SOUP record
+      - name: Upload artifacts (SBOM + Grype JSON + Report)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-and-risk-report
+          path: |
+            sbom.json
+            grype.json
+            report.md
+
+      # 11) (Optional) Fail if Criticals exist — toggle to enforce policy
+      #     We use the JSON to decide after posting the comment.
+      - name: Fail if Critical vulnerabilities exist
+        id: failgate
+        run: |
+          crits=$(jq '[.matches[] | select(.vulnerability.severity=="Critical")] | length' grype.json)
+          echo "critical_count=$crits" >> $GITHUB_OUTPUT
+          if [ "$crits" -gt 0 ]; then
+            echo "Found $crits Critical vulnerabilities"
+            exit 1
+          fi
