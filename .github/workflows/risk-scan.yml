@@ -12,19 +12,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Install and run Syft to generate SBOM
-      - name: Generate SBOM with Syft
-        uses: anchore/syft-action@v0.11.0
-        with:
-          path: .
-          output: cyclonedx-json
-          file: sbom.json
-
-      # Run Grype scan using Anchore's scan-action (correct action)
-      - name: Scan SBOM with Grype
+      # Generate SBOM + run Grype using Anchore scan-action
+      - name: Run Anchore Scan (Syft + Grype)
         uses: anchore/scan-action@v3
         with:
-          sbom: sbom.json
+          path: .
+          # SBOM formats you want:
+          format: cyclonedx-json
           acs-report-enable: true
 
       # 5. Post Grype scan result as PR comment  ← ADD HERE
@@ -37,17 +31,17 @@ jobs:
             $(cat grype-report.txt)
             ```
 
-    
-
-      # Optional: Upload SBOM and scan report
-      - name: Upload SBOM and Scan Report
+      # Upload the generated reports
+      - name: Upload reports
         uses: actions/upload-artifact@v4
         with:
-          name: grype-scan-results
-          path: |
-            sbom.json
-            anchore-reports/
-            
+          name: anchore-scan-results
+          path: anchore-reports/
+          
+          
+
+
+
 
 
 
