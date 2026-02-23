@@ -199,7 +199,7 @@ jobs:
 
       # 10) Upload artifacts for audits / Jira SOUP record
       - name: Upload artifacts (SBOM + Grype JSON + Report)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: sbom-and-risk-report
           path: |
