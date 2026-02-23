@@ -1,3 +1,99 @@
+# ---------------------------------------------------------------------------
+# SBOM & Risk Report (Dependabot-only)
+#
+# Purpose
+#   Produces an audit-ready SBOM and a vulnerability risk summary for every
+#   Dependabot PR that updates dependencies. The job comments back on the PR
+#   with:
+#     • A severity summary (Critical/High/Medium/Low)
+#     • A table of Critical vulnerabilities
+#     • A readable “dependency updates” diff (what changed, from → to)
+#     • A compact SBOM preview (first 100 unique components)
+#   It also uploads the full machine-readable artifacts (SBOM + scan JSON).
+#
+# Why
+#   This ensures each dependency change (SOUP update) is:
+#     • Analyzed consistently
+#     • Documented right in the PR for reviewers
+#     • Backed by artifacts you can attach in your change records (e.g., Jira)
+#
+# When it runs
+#   • Automatically on Pull Requests opened/updated by Dependabot only.
+#   • It will NOT run on developer PRs to keep CI fast and focused.
+#   • It will NOT fail the PR even if Critical issues are found (by design).
+#
+# How it works (high level)
+#   1) Syft generates a CycloneDX JSON SBOM (sbom.json) for the repo contents.
+#   2) Grype scans that SBOM and outputs a vulnerability report (grype.json).
+#   3) The workflow computes:
+#        - severity counts,
+#        - a Critical vulns table (pkg, version, CVE, fix),
+#        - a dependency diff from the PR (manifest/lockfile changes),
+#        - a deduplicated SBOM preview (unique name:version pairs).
+#   4) A single, formatted comment is posted on the PR for quick review.
+#   5) All artifacts (SBOM + grype JSON + the rendered report) are uploaded.
+#
+# Inputs & outputs (artifacts)
+#   • Input: the PR’s changed files (Dependabot updates).
+#   • Output artifacts:
+#       - sbom.json        (CycloneDX JSON, full component inventory)
+#       - grype.json       (complete vulnerability findings)
+#       - report.md        (the exact Markdown posted to the PR)
+#
+# Triggers & scope control
+#   • Trigger: on: pull_request
+#   • Scope: guarded by `if: github.event.pull_request.user.login == 'dependabot[bot]'`
+#             so only Dependabot PRs run this heavy job.
+#   • You can add `workflow_dispatch:` to run it manually for testing.
+#
+# Permissions (principle of least privilege)
+#   • contents: read        – to fetch repo contents
+#   • issues: write         – to post a regular PR comment (PRs are “issues”)
+#   • pull-requests: write  – safe allowance for PR interactions
+#
+# Policy behavior (non-blocking)
+#   • The job never fails the PR. Reviewers decide based on the comment.
+#   • If you later want a policy gate, add a final step to fail on Critical/High
+#     (but consider keeping Dependabot PRs non-blocking and enforce on dev PRs).
+#
+# How to run on demand (no waiting for schedule)
+#   • In Dependabot page: “Check for updates” (manual re-run) to create a PR.
+#   • Or temporarily set your dependabot.yml schedule to `daily`, commit, then
+#     switch back to `weekly` after testing.
+#   • Or add `workflow_dispatch:` to this workflow and run it manually (will
+#     skip if the event is not a Dependabot PR because of the job-level guard).
+#
+# Team expectations (review checklist)
+#   • Read the PR comment:
+#       - Review “📦 Dependency Updates” for from→to changes
+#       - Review “❗ Critical Vulnerabilities” (fix available column helps)
+#       - Scan the severity table (are counts increasing?)
+#       - Expand the SBOM preview block if needed
+#   • Use the uploaded artifacts for deeper analysis or to attach to your
+#     change record (e.g., SOUP ticket in Jira).
+#
+# Troubleshooting
+#   • “Resource not accessible by integration”: ensure workflow permissions
+#     include `issues: write` and `pull-requests: write`.
+#   • “unexpected EOF while looking for matching '” in jq steps:
+#     make sure jq programs are wrapped in double quotes (") and escape any
+#     internal quotes as \" (the file already follows this pattern).
+#   • No dependency updates shown: Dependabot PR may not touch manifests/lockfiles,
+#     or the diff is empty (e.g., PR only rebase). Check the “changed files” tab.
+#   • No SBOM/vulns found: confirm Syft/Grype installed successfully in the log.
+#
+# Safe edits
+#   • All workflows for PR events execute from the base branch copy (main);
+#     update this file on main for changes to take effect on new PR runs.
+#   • Keep the job guard for Dependabot-only runs unless you intend to scan
+#     developer PRs as well (can be moved to a separate workflow if needed).
+#
+# Ownership
+#   • Maintainer: Quality & Regulatory / Security (QRA)
+#   • Contact: <your team or channel>
+#
+# ---------------------------------------------------------------------------
+
 name: SBOM & Risk Report (Dependabot)
 
 on:
