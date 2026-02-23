@@ -145,30 +145,31 @@ jobs:
           fi
 
       # 7) Create a nicely formatted SBOM snippet (first 100 components)
-      - name: Build SBOM summary (first 100 components)
+      - name: Build SBOM summary (first 100 unique components)
         run: |
-          echo "## 🧾 SBOM (CycloneDX) – first 100 components" > sbom.md
+          echo "## 🧾 SBOM (CycloneDX) – first 100 unique components" > sbom.md
           echo "" >> sbom.md
           echo "_Full SBOM attached as artifact (sbom.json)._" >> sbom.md
           echo "" >> sbom.md
           echo "| Component | Version | License |" >> sbom.md
           echo "|---|---|---|" >> sbom.md
-          # Components + best-effort license field
-          jq -r '
-            (.components // []) 
-            | .[0:100]
-            | map({
-                name: (.name // "-"),
-                version: (.version // "-"),
-                license: (
-                  ( .licenses[0].license.name ) // 
-                  ( .licenses[0].expression ) // 
-                  "-"
-                )
-              })
-            | .[]
-            | "| \(.name) | \(.version) | \(.license) |"
-          ' sbom.json >> sbom.md
+
+          # Deduplicate by name+version
+          jq '
+            (.components // []) |
+            map({
+              name: (.name // "-"),
+              version: (.version // "-"),
+              license: (
+                ( .licenses[0].license.name ) //
+                ( .licenses[0].expression ) //
+                "-"
+              )
+            }) |
+            unique_by(.name + ":" + .version) |
+            .[0:100]
+          ' sbom.json |
+          jq -r '.[] | "| \(.name) | \(.version) | \(.license) |"' >> sbom.md
 
       # 8) Assemble a single PR comment (Markdown)
       - name: Assemble PR comment
