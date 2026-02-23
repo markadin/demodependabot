@@ -6,7 +6,7 @@
     </picture>
 </div>
 
-## Dependabot Demo Repository with risk check edit 2
+## Dependabot Demo Repository with risk check edit 3 updated syft store
 
 This repo contains some projects with outdated dependencies. Fork it to try out
 Dependabot :dependabot:!
