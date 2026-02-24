@@ -221,20 +221,26 @@ jobs:
           echo "| Component | Version | License |" >> sbom.md
           echo "|---|---|---|" >> sbom.md
       
-          jq "
+          jq '
             (.components // [])
             | map({
-                name: (.name // \"-\"),
-                version: (.version // \"-\"),
+                name: (.name // "-"),
+                version: (.version // "-"),
                 license: (
-                  (.licenses[0].license.name) //
-                  (.licenses[0].expression) //
-                  \"-\"
+                  # 1: Try CycloneDX license object
+                  ( .licenses[0].license.name ) //
+                  ( .licenses[0].expression ) //
+      
+                  # 2: Fallback: try Syft raw metadata field
+                  ( .properties[]? | select(.name=="syft:metadata:package:license") | .value ) //
+      
+                  # 3: Fallback to "-"
+                  "-"
                 )
               })
-            | unique_by(.name + \":\" + .version)
+            | unique_by(.name + ":" + .version)
             | .[0:100]
-          " sbom.json |
+          ' sbom.json |
           jq -r '.[] | "| \(.name) | \(.version) | \(.license) |"' >> sbom.md
 
       # ------------------------------
