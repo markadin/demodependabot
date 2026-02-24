@@ -149,30 +149,33 @@ jobs:
       - name: Extract dependency updates from PR diff
         run: |
           echo "## 📦 Dependency Updates" > updates.md
-
-          BASE_REF="${{ github.event.pull_request.base.sha }}"
-          HEAD_REF="${{ github.event.pull_request.head.sha }}"
-
-          git diff $BASE_REF $HEAD_REF > diff.txt
-
+      
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+      
+          # 1. List changed files between main → PR branch
+          git diff --name-only "$BASE_SHA" "$HEAD_SHA" > changed_files.txt
+      
+          # 2. Filter for dependency-related files
           DEP_FILES=$(grep -E '(package.json|package-lock.json|requirements|Pipfile|poetry.lock|pyproject.toml|pom.xml|gradle|go.mod|go.sum|Cargo.lock|Gemfile.lock|composer.lock)' changed_files.txt || true)
-
+      
           if [ -z "$DEP_FILES" ]; then
             echo "_No dependency manifest or lockfile changes detected._" >> updates.md
             exit 0
           fi
-
+      
           echo "**Changed dependency files:**" >> updates.md
           echo "$DEP_FILES" | sed 's/^/- `/' | sed 's/$/`/' >> updates.md
           echo "" >> updates.md
           echo "### 🔍 Version changes" >> updates.md
-
+      
+          # 3. Append diffs for each changed dependency file
           for FILE in $DEP_FILES; do
             echo "**$FILE**" >> updates.md
-            git diff origin/${{ github.event.pull_request.base.ref }}...HEAD -- "$FILE" | sed 's/^/    /' >> updates.md
+            git diff "$BASE_SHA" "$HEAD_SHA" -- "$FILE" | sed 's/^/    /' >> updates.md
             echo "" >> updates.md
           done
-
+          
       # ------------------------------
       # 3. Severity summary + Critical table
       # ------------------------------
