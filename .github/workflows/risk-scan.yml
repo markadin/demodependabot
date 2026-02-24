@@ -144,87 +144,67 @@ jobs:
           grype sbom:sbom.json -o table | head -n 100 || true
 
       # ------------------------------
-      # 2. Dependency updates: diff-based when manifests changed,
-      #    otherwise "Recommended Upgrades" from Grype fixes
+      # 2. Extract dependency updates as a structured table
       # ------------------------------
-      - name: Extract dependency updates (smart)
+      - name: Extract dependency updates from PR diff
         run: |
           echo "## 📦 Dependency Updates" > updates.md
-      
+
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-      
-          # 1) Identify changed dependency files
+
+          # get file list
           git diff --name-only "$BASE_SHA" "$HEAD_SHA" > changed_files.txt
-          DEP_FILES=$(grep -E '(package.json|package-lock.json|Gemfile.lock|Gemfile|requirements|Pipfile|poetry.lock|pyproject.toml|go.mod|go.sum|Cargo.lock|composer.lock)' changed_files.txt || true)
-      
-          if [ -n "$DEP_FILES" ]; then
-            # ---- Show structured diff table (old -> new) ----
-            echo "**Changed dependency files:**" >> updates.md
-            echo "$DEP_FILES" | sed 's/^/- `/' | sed 's/$/`/' >> updates.md
-            echo "" >> updates.md
-            echo "### 🔍 Version Changes (Structured Table)" >> updates.md
-            echo "" >> updates.md
-            echo "| Package | Old Version | New Version | File |" >> updates.md
-            echo "|--------|-------------|-------------|------|" >> updates.md
-      
-            for FILE in $DEP_FILES; do
-              # Grep +/- lines that look like entries (works for npm/package.json and many lockfiles)
-              git diff "$BASE_SHA" "$HEAD_SHA" -- "$FILE" \
-              | grep -E '^[+-].*"' \
-              | sed 's/^[+]//; s/^[-]//' > /tmp/_lines.txt
-      
-              # Pair simplistic old/new for common formats (npm etc.)
-              # You can refine this parser per ecosystem if needed.
-              awk -F: '
-                BEGIN{pkg=""; old=""; new=""}
-                /".*":/{
-                  gsub(/[",]/,""); name=$1; gsub(/^[ \t+*-]+/,"",name);
-                  ver=$2; gsub(/[ \t]/,"",ver);
-                  if ($0 ~ /^-/) { old=ver; pkg=name }
-                  else if ($0 ~ /^\+/) { new=ver }
-                  if (pkg!="" && old!="" && new!="") {
-                    printf("| %s | %s | %s | %s |\n", pkg, old, new, FILENAME_OUT)
-                    pkg=""; old=""; new=""
-                  }
-                }
-              ' FILENAME_OUT="$FILE" /tmp/_lines.txt >> updates.md
-            done
-      
+
+          DEP_FILES=$(grep -E '(package.json|package-lock.json|Gemfile.lock|requirements|Pipfile|poetry.lock|go.mod|go.sum|Cargo.lock|composer.lock)' changed_files.txt || true)
+
+          if [ -z "$DEP_FILES" ]; then
+            echo "_No dependency manifest or lockfile changes detected._" >> updates.md
             exit 0
           fi
-      
-          # 2) No manifests changed (e.g., GitHub Actions PR). Show recommended upgrades from Grype fixes.
-          echo "_No dependency manifest or lockfile changes detected._" >> updates.md
+
+          echo "**Changed dependency files:**" >> updates.md
+          echo "$DEP_FILES" | sed 's/^/- `/' | sed 's/$/`/' >> updates.md
           echo "" >> updates.md
-          echo "### 🔧 Recommended Upgrades (from vulnerability fixes)" >> updates.md
+
+          echo "### 🔍 Version Changes (Structured Table)" >> updates.md
           echo "" >> updates.md
-      
-          # Build a table from grype.json: include only entries that have a fix version and look like app deps (npm/gem/etc.)
-          echo "| Package | Installed | Fixed Version | Severity | Ecosystem | Advisory |" >> updates.md
-          echo "|--------|-----------|---------------|----------|-----------|----------|" >> updates.md
-      
-          jq -r '
-            .matches[]
-            | select(.vulnerability.fix.versions[0] != null)
-            | {
-                pkg: (.artifact.name // "-"),
-                installed: (.artifact.version // "-"),
-                fixed: (.vulnerability.fix.versions[0] // "-"),
-                sev: (.vulnerability.severity // "-"),
-                eco: (
-                  ( .artifact.purl // "" )
-                  | if startswith("pkg:npm/") then "npm"
-                    elif startswith("pkg:gem/") then "ruby"
-                    elif startswith("pkg:pypi/") then "python"
-                    elif startswith("pkg:golang/") then "go"
-                    elif startswith("pkg:cargo/") then "rust"
-                    else "other" end
-                ),
-                adv: (.vulnerability.id // "-")
-              }
-            | "| \(.pkg) | \(.installed) | \(.fixed) | \(.sev) | \(.eco) | \(.adv) |"
-          ' grype.json >> updates.md
+          echo "| Package | Old Version | New Version | File |" >> updates.md
+          echo "|--------|-------------|-------------|------|" >> updates.md
+
+          for FILE in $DEP_FILES; do
+            git diff "$BASE_SHA" "$HEAD_SHA" -- "$FILE" \
+            | grep -E '^[+-].*"(version"|": )' \
+            | sed 's/^[+]//' | sed 's/^[-]//' \
+            | sed 's/[",]//g' > /tmp/version_lines.txt
+
+            # Parse old/new pairs
+            OLD_VERSION=""
+            NEW_VERSION=""
+            PACKAGE=""
+            while read -r line; do
+              # Example patterns:
+              #   "lodash": "^4.17.15"
+              #   version: 1.0.0 
+              NAME=$(echo "$line" | awk -F: '{print $1}' | tr -d ' ')
+              VER=$(echo "$line" | awk -F: '{print $2}' | tr -d ' ')
+
+              if [[ $line == -* ]]; then
+                OLD_VERSION=$VER
+                PACKAGE=$NAME
+              elif [[ $line == +* ]]; then
+                NEW_VERSION=$VER
+              fi
+
+              # Emit row once both old/new present
+              if [ -n "$OLD_VERSION" ] && [ -n "$NEW_VERSION" ]; then
+                echo "| $PACKAGE | $OLD_VERSION | $NEW_VERSION | $FILE |" >> updates.md
+                OLD_VERSION=""
+                NEW_VERSION=""
+                PACKAGE=""
+              fi
+            done < <(git diff "$BASE_SHA" "$HEAD_SHA" -- "$FILE" | grep -E '^[+-].*"')
+          done
           
       # ------------------------------
       # 3. Severity summary + Detailed tables (Critical, High, Medium)
