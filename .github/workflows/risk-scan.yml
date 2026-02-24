@@ -177,7 +177,7 @@ jobs:
           done
           
       # ------------------------------
-      # 3. Severity summary + Critical table
+      # 3. Severity summary + Detailed tables (Critical, High, Medium)
       # ------------------------------
       - name: Build vulnerability summary
         run: |
@@ -188,34 +188,59 @@ jobs:
             | sort_by(.severity)
             | reverse
           " grype.json > /tmp/severity_counts.json
-      
+
           echo "## 🧮 Severity Summary" > severity.md
           echo "| Severity | Count |" >> severity.md
           echo "|---|---:|" >> severity.md
           jq -r '.[] | "| \(.severity) | \(.count) |"' /tmp/severity_counts.json >> severity.md
 
-      - name: Extract critical vulnerabilities
+      - name: Extract vulnerabilities by severity (Critical / High / Medium)
         run: |
-          jq "
-            [.matches[]
-              | select(.vulnerability.severity==\"Critical\")
-              | {
-                  pkg: .artifact.name,
-                  version: .artifact.version,
-                  vuln: .vulnerability.id,
-                  fix: (.vulnerability.fix.versions[0] // \"-\")
-                }
-            ]
-          " grype.json > /tmp/critical_list.json
-      
-          echo "## ❗ Critical Vulnerabilities" > critical.md
-          if [ "$(jq 'length' /tmp/critical_list.json)" -eq 0 ]; then
-            echo "_No Critical vulnerabilities found._" >> critical.md
-          else
-            echo "| Package | Version | Vulnerability | Fix |" >> critical.md
-            echo "|---|---|---|---|" >> critical.md
-            jq -r '.[] | "| \(.pkg) | \(.version) | \(.vuln) | \(.fix) |"' /tmp/critical_list.json >> critical.md
-          fi
+          #################################################################
+          # Helper to build a table for a given severity into a given file
+          #################################################################
+          make_table() {
+            local severity="$1"
+            local outfile="$2"
+
+            jq "
+              [.matches[]
+                | select(.vulnerability.severity==\"${severity}\")
+                | {
+                    pkg: .artifact.name,
+                    version: .artifact.version,
+                    vuln: .vulnerability.id,
+                    fix: (.vulnerability.fix.versions[0] // \"-\")
+                  }
+              ]
+            " grype.json > "$outfile"
+
+            local count
+            count=$(jq 'length' "$outfile")
+
+            # Write section header + table (or 'none found') into the same file
+            # so each severity file is self-contained and easy to include later.
+            {
+              echo "## ${severity} Vulnerabilities"
+              if [ "$count" -eq 0 ]; then
+                echo "_No ${severity} vulnerabilities found._"
+              else
+                echo "| Package | Version | Vulnerability | Fix |"
+                echo "|---|---|---|---|"
+                jq -r '.[] | "| \(.pkg) | \(.version) | \(.vuln) | \(.fix) |"' "$outfile"
+              fi
+            } > "${outfile}.md"
+          }
+
+          # Generate all three severities
+          make_table "Critical" "/tmp/critical_list.json"
+          make_table "High"     "/tmp/high_list.json"
+          make_table "Medium"   "/tmp/medium_list.json"
+
+          # Move to predictable filenames used by the assemble step
+          mv /tmp/critical_list.json.md critical.md
+          mv /tmp/high_list.json.md     high.md
+          mv /tmp/medium_list.json.md   medium.md
 
       # ------------------------------
       # 4. SBOM summary (show unique components only)
@@ -259,12 +284,24 @@ jobs:
             echo "## 🔒 Dependency Risk Report (Dependabot)"
             echo "**PR:** #${{ github.event.pull_request.number }}"
             echo ""
+
+            # Severity summary
             cat severity.md
             echo ""
+
+            # Critical / High / Medium
             cat critical.md
             echo ""
+            cat high.md
+            echo ""
+            cat medium.md
+            echo ""
+
+            # Dependency updates
             cat updates.md
             echo ""
+
+            # SBOM preview
             echo "<details><summary>SBOM (first 100 unique components)</summary>"
             echo ""
             cat sbom.md
