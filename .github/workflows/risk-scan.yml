@@ -144,36 +144,66 @@ jobs:
           grype sbom:sbom.json -o table | head -n 100 || true
 
       # ------------------------------
-      # 2. Extract dependency updates from PR diff
+      # 2. Extract dependency updates as a structured table
       # ------------------------------
       - name: Extract dependency updates from PR diff
         run: |
           echo "## 📦 Dependency Updates" > updates.md
-      
+
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-      
-          # 1. List changed files between main → PR branch
+
+          # get file list
           git diff --name-only "$BASE_SHA" "$HEAD_SHA" > changed_files.txt
-      
-          # 2. Filter for dependency-related files
-          DEP_FILES=$(grep -E '(package.json|package-lock.json|requirements|Pipfile|poetry.lock|pyproject.toml|pom.xml|gradle|go.mod|go.sum|Cargo.lock|Gemfile.lock|composer.lock)' changed_files.txt || true)
-      
+
+          DEP_FILES=$(grep -E '(package.json|package-lock.json|Gemfile.lock|requirements|Pipfile|poetry.lock|go.mod|go.sum|Cargo.lock|composer.lock)' changed_files.txt || true)
+
           if [ -z "$DEP_FILES" ]; then
             echo "_No dependency manifest or lockfile changes detected._" >> updates.md
             exit 0
           fi
-      
+
           echo "**Changed dependency files:**" >> updates.md
           echo "$DEP_FILES" | sed 's/^/- `/' | sed 's/$/`/' >> updates.md
           echo "" >> updates.md
-          echo "### 🔍 Version changes" >> updates.md
-      
-          # 3. Append diffs for each changed dependency file
+
+          echo "### 🔍 Version Changes (Structured Table)" >> updates.md
+          echo "" >> updates.md
+          echo "| Package | Old Version | New Version | File |" >> updates.md
+          echo "|--------|-------------|-------------|------|" >> updates.md
+
           for FILE in $DEP_FILES; do
-            echo "**$FILE**" >> updates.md
-            git diff "$BASE_SHA" "$HEAD_SHA" -- "$FILE" | sed 's/^/    /' >> updates.md
-            echo "" >> updates.md
+            git diff "$BASE_SHA" "$HEAD_SHA" -- "$FILE" \
+            | grep -E '^[+-].*"(version"|": )' \
+            | sed 's/^[+]//' | sed 's/^[-]//' \
+            | sed 's/[",]//g' > /tmp/version_lines.txt
+
+            # Parse old/new pairs
+            OLD_VERSION=""
+            NEW_VERSION=""
+            PACKAGE=""
+            while read -r line; do
+              # Example patterns:
+              #   "lodash": "^4.17.15"
+              #   version: 1.0.0 
+              NAME=$(echo "$line" | awk -F: '{print $1}' | tr -d ' ')
+              VER=$(echo "$line" | awk -F: '{print $2}' | tr -d ' ')
+
+              if [[ $line == -* ]]; then
+                OLD_VERSION=$VER
+                PACKAGE=$NAME
+              elif [[ $line == +* ]]; then
+                NEW_VERSION=$VER
+              fi
+
+              # Emit row once both old/new present
+              if [ -n "$OLD_VERSION" ] && [ -n "$NEW_VERSION" ]; then
+                echo "| $PACKAGE | $OLD_VERSION | $NEW_VERSION | $FILE |" >> updates.md
+                OLD_VERSION=""
+                NEW_VERSION=""
+                PACKAGE=""
+              fi
+            done < <(git diff "$BASE_SHA" "$HEAD_SHA" -- "$FILE" | grep -E '^[+-].*"')
           done
           
       # ------------------------------
