@@ -336,7 +336,7 @@ jobs:
 
       # ------------------------------
       # 8) Latest Available Versions — compute from lockfile diffs (Bundler + npm)
-      #     Falls back to dependabot/fetch-metadata when versions are unavailable
+      #     Falls back to dependabot/fetch-metadata only if no versions were found
       # ------------------------------
       - name: Build dependency latest-version table
         shell: bash
@@ -348,7 +348,7 @@ jobs:
           echo "| Package | Current | Latest | Ecosystem | Update |" >> latest.md
           echo "|---|---|---|---|---|" >> latest.md
 
-          # Dependabot metadata (works for single-dep PRs; names for grouped PRs)
+          # Dependabot metadata
           PKGS="${{ steps.metadata.outputs.dependency-names }}"
           ECO="${{ steps.metadata.outputs.package-ecosystem }}"
           TYPE="${{ steps.metadata.outputs.update-type }}"
@@ -362,10 +362,8 @@ jobs:
           git diff --name-only "$BASE_SHA" "$HEAD_SHA" > /tmp/changed_files.txt || true
           DEP_FILES=$(grep -E '(Gemfile.lock|package-lock.json|npm-shrinkwrap.json)' /tmp/changed_files.txt || true)
 
-          # Helpers to parse lockfiles into "name version" lines
+          # Helpers to parse lockfiles
           parse_bundler_map () {
-            # Reads Gemfile.lock on stdin and prints "name version" lines
-            # Matches lines like: "    package_name (1.2.3)"
             awk '
               /^[[:space:]]+[A-Za-z0-9_.\-]+ \([0-9][^)]*\)/ {
                 line=$0
@@ -381,8 +379,6 @@ jobs:
           }
 
           parse_npm_map () {
-            # Reads package-lock.json on stdin and prints "name version" lines
-            # Lockfile v2+: prefer .packages; fallback to .dependencies for older formats
             jq -r '
               if has("packages") then
                 (.packages | to_entries[]
@@ -399,67 +395,73 @@ jobs:
             '
           }
 
-          # Build rows by diffing BASE vs HEAD for each lockfile
+          # Track whether any diffs produced rows
           rows_generated=0
 
+          # Iterate through changed dependency files
           while IFS= read -r f; do
             [ -z "$f" ] && continue
+
             case "$f" in
               *Gemfile.lock)
                 git show "${BASE_SHA}:${f}" > /tmp/base.lock 2>/dev/null || true
                 git show "${HEAD_SHA}:${f}" > /tmp/head.lock 2>/dev/null || true
                 [ ! -s /tmp/base.lock ] || [ ! -s /tmp/head.lock ] && continue
 
-                parse_bundler_map < /tmp/base.lock | sort -u > /tmp/base.map || true
-                parse_bundler_map < /tmp/head.lock | sort -u > /tmp/head.map || true
+                parse_bundler_map < /tmp/base.lock | sort -u > /tmp/base.map
+                parse_bundler_map < /tmp/head.lock | sort -u > /tmp/head.map
 
-                # Join by name, print only changed versions
                 join -a1 -a2 -e "-" -o auto -j 1 \
                   <(awk '{print $1" "$2}' /tmp/base.map | sort) \
                   <(awk '{print $1" "$2}' /tmp/head.map | sort) \
-                  | awk '{old=$2; new=$3; if (old!=new) print $1, old, new}' \
-                  | while read -r name oldver newver; do
-                      echo "| $name | ${oldver:-'-'} | ${newver:-'-'} | bundler | ${TYPE:-version-update:unknown} |" >> latest.md
-                      rows_generated=$((rows_generated+1))
-                    done
+                | awk '{old=$2; new=$3; if (old!=new) print $1, old, new}' \
+                | while read -r name oldver newver; do
+                    echo "| $name | ${oldver:-'-'} | ${newver:-'-'} | bundler | ${TYPE:-version-update:unknown} |" >> latest.md
+                    rows_generated=$((rows_generated+1))
+                  done
                 ;;
+              
               *package-lock.json|*npm-shrinkwrap.json)
                 git show "${BASE_SHA}:${f}" > /tmp/base.lock 2>/dev/null || true
                 git show "${HEAD_SHA}:${f}" > /tmp/head.lock 2>/dev/null || true
                 [ ! -s /tmp/base.lock ] || [ ! -s /tmp/head.lock ] && continue
 
-                parse_npm_map < /tmp/base.lock | sort -u > /tmp/base.map || true
-                parse_npm_map < /tmp/head.lock | sort -u > /tmp/head.map || true
+                parse_npm_map < /tmp/base.lock | sort -u > /tmp/base.map
+                parse_npm_map < /tmp/head.lock | sort -u > /tmp/head.map
 
                 join -a1 -a2 -e "-" -o auto -j 1 \
                   <(sort /tmp/base.map) \
                   <(sort /tmp/head.map) \
-                  | awk '{old=$2; new=$3; if (old!=new) print $1, old, new}' \
-                  | while read -r name oldver newver; do
-                      echo "| $name | ${oldver:-'-'} | ${newver:-'-'} | npm | ${TYPE:-version-update:unknown} |" >> latest.md
-                      rows_generated=$((rows_generated+1))
-                    done
+                | awk '{old=$2; new=$3; if (old!=new) print $1, old, new}' \
+                | while read -r name oldver newver; do
+                    echo "| $name | ${oldver:-'-'} | ${newver:-'-'} | npm | ${TYPE:-version-update:unknown} |" >> latest.md
+                    rows_generated=$((rows_generated+1))
+                  done
                 ;;
             esac
           done <<< "$DEP_FILES"
 
-          # If we couldn't compute versions (e.g., other ecosystems), fall back to metadata
-          if [[ $rows_generated -eq 0 ]]; then
+          # -------- Correct fallback (runs ONLY when no diff rows exist) --------
+          if [[ "$rows_generated" -eq 0 ]]; then
+
+            # Single-dependency PRs (Dependabot metadata has versions)
             if [[ -n "$NEW_META" || -n "$OLD_META" ]]; then
-              # Single-dependency PR
               echo "| ${PKGS:-'-'} | ${OLD_META:-'-'} | ${NEW_META:-'-'} | ${ECO:-'-'} | ${TYPE:-'-'} |" >> latest.md
+
+            # Grouped PR, no lockfile diff (show names only)
             elif [[ -n "$PKGS" ]]; then
-              # Grouped PR, but we couldn't parse versions from lockfiles -> names only
               IFS=',' read -ra NAMES <<< "$PKGS"
               for n in "${NAMES[@]}"; do
                 name_trimmed=$(echo "$n" | xargs)
                 echo "| ${name_trimmed} | - | - | ${ECO:-'-'} | ${TYPE:-'-'} |" >> latest.md
               done
+
+            # No metadata available at all
             else
               echo "_No dependency metadata available._" >> latest.md
             fi
-          fi
 
+          fi
       # ------------------------------
       # 9) Assemble PR comment
       # ------------------------------
