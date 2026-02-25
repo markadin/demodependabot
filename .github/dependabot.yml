@@ -6,7 +6,7 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "daily"
+      interval: "weekly"
 
     # Group all GitHub Action updates into one PR
     groups:
@@ -27,7 +27,7 @@ updates:
   - package-ecosystem: "npm"
     directory: "/javascript"
     schedule:
-      interval: "daily"
+      interval: "weekly"
 
     # Group all npm updates into one PR
     groups:
@@ -48,7 +48,7 @@ updates:
   - package-ecosystem: "bundler"
     directory: "/ruby"
     schedule:
-      interval: "daily"
+      interval: "weekly"
 
     # Group all bundler updates into one PR
     groups:
