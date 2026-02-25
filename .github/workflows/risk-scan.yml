@@ -119,6 +119,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      # This step is used to check the current/latest versions
+      - name: Inspect dependencies
+        id: inspect
+        uses: dependabot/inspect-action@v2
+    
+
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
@@ -267,6 +273,18 @@ jobs:
           ' sbom.json |
           jq -r '.[] | "| \(.name) | \(.version) | \(.license) |"' >> sbom.md
 
+      # Build the dependency updates table
+      - name: Build dependency latest-version table
+        run: |
+          echo "## 📌 Latest Available Versions" > latest.md
+          echo "" >> latest.md
+          echo "| Package | Current | Latest | Ecosystem | Update |" >> latest.md
+          echo "|---|---|---|---|---|" >> latest.md
+
+          echo '${{ steps.inspect.outputs.dependencies }}' \
+            | jq -r '.[] | "| \(.name) | \(.version) | \(.latest) | \(.package_manager) | \(.update_type) |"' \
+            >> latest.md
+      
       # ------------------------------
       # 5. Build PR comment
       # ------------------------------
@@ -292,6 +310,11 @@ jobs:
             # Dependency updates
             cat updates.md
             echo ""
+
+            # Latest versions     
+            cat latest.md
+            echo ""
+
 
             # SBOM preview
             echo "<details><summary>SBOM (first 100 unique components)</summary>"
