@@ -335,25 +335,121 @@ jobs:
           | jq -r '.[] | "| \(.name) | \(.version) | \(.license) |"' >> sbom.md
 
       # ------------------------------
-      # 8) “Latest Available Versions” (metadata-only)
+      # 8) Latest Available Versions — compute from lockfile diffs (Bundler + npm)
+      #     Falls back to dependabot/fetch-metadata when versions are unavailable
       # ------------------------------
       - name: Build dependency latest-version table
+        shell: bash
         run: |
+          set -euo pipefail
+
           echo "## 📌 Latest Available Versions" > latest.md
           echo "" >> latest.md
           echo "| Package | Current | Latest | Ecosystem | Update |" >> latest.md
           echo "|---|---|---|---|---|" >> latest.md
 
+          # Dependabot metadata (works for single-dep PRs; names for grouped PRs)
           PKGS="${{ steps.metadata.outputs.dependency-names }}"
           ECO="${{ steps.metadata.outputs.package-ecosystem }}"
           TYPE="${{ steps.metadata.outputs.update-type }}"
-          OLD="${{ steps.metadata.outputs.previous-version }}"
-          NEW="${{ steps.metadata.outputs.new-version }}"
+          OLD_META="${{ steps.metadata.outputs.previous-version }}"
+          NEW_META="${{ steps.metadata.outputs.new-version }}"
 
-          if [ -n "$NEW" ] || [ -n "$OLD" ]; then
-            echo "| ${PKGS:-'-'} | ${OLD:-'-'} | ${NEW:-'-'} | ${ECO:-'-'} | ${TYPE:-'-'} |" >> latest.md
-          else
-            if [ -n "$PKGS" ]; then
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          # List files changed in this PR
+          git diff --name-only "$BASE_SHA" "$HEAD_SHA" > /tmp/changed_files.txt || true
+          DEP_FILES=$(grep -E '(Gemfile.lock|package-lock.json|npm-shrinkwrap.json)' /tmp/changed_files.txt || true)
+
+          # Helpers to parse lockfiles into "name version" lines
+          parse_bundler_map () {
+            # Reads Gemfile.lock on stdin and prints "name version" lines
+            # Matches lines like: "    package_name (1.2.3)"
+            awk '
+              /^[[:space:]]+[A-Za-z0-9_.\-]+ \([0-9][^)]*\)/ {
+                line=$0
+                sub(/^[ \t]+/,"",line)
+                name=line
+                sub(/ .*/,"",name)
+                ver=line
+                sub(/^[^ ]+ \(/,"",ver)
+                sub(/\).*/,"",ver)
+                print name " " ver
+              }
+            '
+          }
+
+          parse_npm_map () {
+            # Reads package-lock.json on stdin and prints "name version" lines
+            # Lockfile v2+: prefer .packages; fallback to .dependencies for older formats
+            jq -r '
+              if has("packages") then
+                (.packages | to_entries[]
+                  | select(.key | startswith("node_modules/"))
+                  | {n: (.key | sub("^node_modules/"; "")), v: (.value.version // empty)}
+                )
+              else
+                (.dependencies // {} | to_entries[]
+                  | {n: .key, v: (.value.version // empty)}
+                )
+              end
+              | select(.v != null and .v != "")
+              | "\(.n) \(.v)"
+            '
+          }
+
+          # Build rows by diffing BASE vs HEAD for each lockfile
+          rows_generated=0
+
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              *Gemfile.lock)
+                git show "${BASE_SHA}:${f}" > /tmp/base.lock 2>/dev/null || true
+                git show "${HEAD_SHA}:${f}" > /tmp/head.lock 2>/dev/null || true
+                [ ! -s /tmp/base.lock ] || [ ! -s /tmp/head.lock ] && continue
+
+                parse_bundler_map < /tmp/base.lock | sort -u > /tmp/base.map || true
+                parse_bundler_map < /tmp/head.lock | sort -u > /tmp/head.map || true
+
+                # Join by name, print only changed versions
+                join -a1 -a2 -e "-" -o auto -j 1 \
+                  <(awk '{print $1" "$2}' /tmp/base.map | sort) \
+                  <(awk '{print $1" "$2}' /tmp/head.map | sort) \
+                  | awk '{old=$2; new=$3; if (old!=new) print $1, old, new}' \
+                  | while read -r name oldver newver; do
+                      echo "| $name | ${oldver:-'-'} | ${newver:-'-'} | bundler | ${TYPE:-version-update:unknown} |" >> latest.md
+                      rows_generated=$((rows_generated+1))
+                    done
+                ;;
+              *package-lock.json|*npm-shrinkwrap.json)
+                git show "${BASE_SHA}:${f}" > /tmp/base.lock 2>/dev/null || true
+                git show "${HEAD_SHA}:${f}" > /tmp/head.lock 2>/dev/null || true
+                [ ! -s /tmp/base.lock ] || [ ! -s /tmp/head.lock ] && continue
+
+                parse_npm_map < /tmp/base.lock | sort -u > /tmp/base.map || true
+                parse_npm_map < /tmp/head.lock | sort -u > /tmp/head.map || true
+
+                join -a1 -a2 -e "-" -o auto -j 1 \
+                  <(sort /tmp/base.map) \
+                  <(sort /tmp/head.map) \
+                  | awk '{old=$2; new=$3; if (old!=new) print $1, old, new}' \
+                  | while read -r name oldver newver; do
+                      echo "| $name | ${oldver:-'-'} | ${newver:-'-'} | npm | ${TYPE:-version-update:unknown} |" >> latest.md
+                      rows_generated=$((rows_generated+1))
+                    done
+                ;;
+            esac
+          done <<< "$DEP_FILES"
+
+          # If we couldn't compute versions (e.g., other ecosystems), fall back to metadata
+          if [[ $rows_generated -eq 0 ]]; then
+            if [[ -n "$NEW_META" || -n "$OLD_META" ]]; then
+              # Single-dependency PR
+              echo "| ${PKGS:-'-'} | ${OLD_META:-'-'} | ${NEW_META:-'-'} | ${ECO:-'-'} | ${TYPE:-'-'} |" >> latest.md
+            elif [[ -n "$PKGS" ]]; then
+              # Grouped PR, but we couldn't parse versions from lockfiles -> names only
               IFS=',' read -ra NAMES <<< "$PKGS"
               for n in "${NAMES[@]}"; do
                 name_trimmed=$(echo "$n" | xargs)
