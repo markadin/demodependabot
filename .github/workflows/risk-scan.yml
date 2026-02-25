@@ -381,23 +381,33 @@ jobs:
 
           parse_npm() {
             jq -r '
-              # 1) NPM lockfile v2+ (“packages” block)
+              # 1) NPM lockfile v2+ “packages” block: normalize to the LAST path segment after the final "node_modules/"
+              #    This turns "node_modules/@scope/pkg" -> "@scope/pkg"
+              #    and     "node_modules/@scope/pkg/node_modules/dep" -> "dep"
               if has("packages") then
                 (
                   .packages
                   | to_entries[]
-                  | select(.key | startswith("node_modules/"))
-                  | {n: (.key | sub("^node_modules/"; "")), v: (.value.version // empty)}
+                  | select(.key | contains("node_modules/"))
+                  | {
+                      n: (
+                        .key
+                        | split("node_modules/")
+                        | last
+                      ),
+                      v: (.value.version // empty)
+                    }
                 )
-              else
-                empty
-              end,
-              # 2) Top-level dependencies (always present)
+              else empty end,
+          
+              # 2) v1/v2 top-level dependency map (exact versions in lockfile, not ranges)
               (
                 .dependencies // {}
                 | to_entries[]
-                | {n: .key, v: (.value.version // empty)}
+                | { n: .key, v: (.value.version // empty) }
               )
+          
+              # Emit "name version" pairs only when version is non-empty
               | select(.v != null and .v != "")
               | "\(.n) \(.v)"
             '
