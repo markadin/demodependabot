@@ -95,6 +95,11 @@
 #   • Contact: <your team or channel>
 #
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# SBOM & Risk Report (Dependabot-only) — Option B: scan BASE + HEAD
+# ---------------------------------------------------------------------------
+
 name: SBOM & Risk Report (Dependabot)
 
 on:
@@ -113,17 +118,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ------------------------------
-      # Checkout
-      # ------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # --------------------------------------------------
-      # Dependabot Metadata (used ONLY for single-dep PRs)
-      # --------------------------------------------------
+      # Use the official metadata action for Dependabot PR context
       - name: Dependabot metadata
         id: metadata
         uses: dependabot/fetch-metadata@v2
@@ -134,55 +134,59 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y jq
 
       # ------------------------------
-      # Install Syft
+      # 1) Install Syft
       # ------------------------------
       - name: Install Syft
         run: |
           curl -sSfL https://get.anchore.io/syft | sudo sh -s -- -b /usr/local/bin
 
       # ------------------------------
-      # Prepare BASE + HEAD directories
+      # 2) Prepare BASE worktree and generate SBOMs for BASE & HEAD
       # ------------------------------
+      # NEW/CHANGED: we now generate sbom_base.json and sbom_head.json
       - name: Prepare BASE worktree
         run: |
           git worktree add --detach /tmp/base "${{ github.event.pull_request.base.sha }}"
 
-      # ------------------------------
-      # Generate SBOMs (CycloneDX JSON)
-      # ------------------------------
-      - name: SBOM (BASE)
+      - name: Generate SBOM (CycloneDX JSON) — BASE
         run: syft dir:/tmp/base -o cyclonedx-json > sbom_base.json
 
-      - name: SBOM (HEAD)
+      - name: Generate SBOM (CycloneDX JSON) — HEAD
         run: syft dir:. -o cyclonedx-json > sbom_head.json
 
       # ------------------------------
-      # Install Grype + scan SBOMs
+      # 3) Install Grype and scan both SBOMs
       # ------------------------------
       - name: Install Grype
         run: |
           curl -sSfL https://get.anchore.io/grype | sudo sh -s -- -b /usr/local/bin
 
-      - name: Grype scan (BASE + HEAD)
+      # NEW/CHANGED: produce grype_base.json and grype_head.json
+      - name: Run vulnerability scans (Grype) — BASE & HEAD
         run: |
           grype sbom:sbom_base.json -o json > grype_base.json || true
           grype sbom:sbom_head.json -o json > grype_head.json || true
 
+          echo "---- BASE (first 50 lines) ----"
+          grype sbom:sbom_base.json -o table | head -n 50 || true
+          echo "---- HEAD (first 50 lines) ----"
+          grype sbom:sbom_head.json -o table | head -n 50 || true
+
       # ------------------------------
-      # Dependency update diff (file list only)
+      # 4) Dependency updates (file list only)
       # ------------------------------
-      - name: Dependency files changed
+      - name: Extract dependency updates from PR diff
         run: |
           echo "## 📦 Dependency Updates" > updates.md
 
-          BASE="${{ github.event.pull_request.base.sha }}"
-          HEAD="${{ github.event.pull_request.head.sha }}"
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
 
-          git diff --name-only "$BASE" "$HEAD" > /tmp/changed.txt
+          git diff --name-only "$BASE_SHA" "$HEAD_SHA" > changed_files.txt
 
-          DEP_FILES=$(grep -E '(Gemfile.lock|package-lock.json|npm-shrinkwrap.json|pom.xml|go.sum|Cargo.lock|composer.lock|Pipfile.lock|poetry.lock)' /tmp/changed.txt || true)
+          DEP_FILES=$(grep -E '(package.json|package-lock.json|Gemfile|Gemfile.lock|requirements|Pipfile|poetry.lock|pyproject.toml|go.mod|go.sum|Cargo.lock|composer.lock)' changed_files.txt || true)
 
-          if [[ -z "$DEP_FILES" ]]; then
+          if [ -z "$DEP_FILES" ]; then
             echo "_No dependency manifest or lockfile changes detected._" >> updates.md
           else
             echo "**Changed dependency files:**" >> updates.md
@@ -191,11 +195,73 @@ jobs:
           fi
 
       # ------------------------------
-      # BASE vs HEAD Vulnerability Diff
+      # 5) HEAD-only: Severity summary + per-severity tables
       # ------------------------------
-      - name: Compute vuln deltas
+      # NEW/CHANGED: run summaries from grype_head.json (remaining vulns after the PR)
+      - name: Build severity summary (HEAD)
+        run: |
+          jq "
+            [.matches[].vulnerability.severity]
+            | group_by(.)
+            | map({severity: .[0], count: length})
+            | sort_by(.severity)
+            | reverse
+          " grype_head.json > /tmp/severity_counts.json
+
+          echo "## 🧮 Severity Summary (after this PR)" > severity.md
+          echo "| Severity | Count |" >> severity.md
+          echo "|---|---:|" >> severity.md
+          jq -r '.[] | "| \(.severity) | \(.count) |"' /tmp/severity_counts.json >> severity.md
+
+      - name: Extract vulnerabilities by severity (HEAD)
+        run: |
+          make_table() {
+            local severity="$1"
+            local outfile="$2"
+
+            jq "
+              [.matches[]
+                | select(.vulnerability.severity==\"${severity}\")
+                | {
+                    pkg: .artifact.name,
+                    version: .artifact.version,
+                    vuln: .vulnerability.id,
+                    fix: (.vulnerability.fix.versions[0] // \"-\")
+                  }
+              ]
+            " grype_head.json > "$outfile"
+
+            local count
+            count=$(jq 'length' "$outfile")
+
+            {
+              echo "## ${severity} Vulnerabilities (remaining after this PR)"
+              if [ "$count" -eq 0 ]; then
+                echo "_No ${severity} vulnerabilities remain._"
+              else
+                echo "| Package | Version | Vulnerability | Fix |"
+                echo "|---|---|---|---|"
+                jq -r '.[] | "| \(.pkg) | \(.version) | \(.vuln) | \(.fix) |"' "$outfile"
+              fi
+            } > "${outfile}.md"
+          }
+
+          make_table "Critical" "/tmp/critical_list.json"
+          make_table "High"     "/tmp/high_list.json"
+          make_table "Medium"   "/tmp/medium_list.json"
+
+          mv /tmp/critical_list.json.md critical.md
+          mv /tmp/high_list.json.md     high.md
+          mv /tmp/medium_list.json.md   medium.md
+
+      # ------------------------------
+      # 6) DIFF BASE vs HEAD: Fixed-by-this-PR and Introduced-by-this-PR
+      # ------------------------------
+      # NEW: normalized tuple: name|version|vuln|severity|fixver
+      - name: Compute resolved/new vulnerability sets
         run: |
           norm() {
+            local file="$1"
             jq -r '
               .matches[]
               | [
@@ -205,95 +271,49 @@ jobs:
                   (.vulnerability.severity // "-"),
                   (.vulnerability.fix.versions[0] // "-")
                 ] | join("|")
-            ' "$1" | sort -u
+            ' "$file" | sort -u
           }
 
-          norm grype_base.json > /tmp/base_v.txt
-          norm grype_head.json > /tmp/head_v.txt
+          norm grype_base.json > /tmp/base.txt || true
+          norm grype_head.json > /tmp/head.txt || true
 
-          comm -23 /tmp/base_v.txt /tmp/head_v.txt > /tmp/fixed.txt     # BASE only
-          comm -13 /tmp/base_v.txt /tmp/head_v.txt > /tmp/new.txt       # HEAD only
+          # Resolved = present in BASE but not in HEAD
+          comm -23 /tmp/base.txt /tmp/head.txt > /tmp/resolved.txt || true
+          # New = present in HEAD but not in BASE
+          comm -13 /tmp/base.txt /tmp/head.txt > /tmp/new.txt || true
 
+          # Build "Resolved by this PR"
           {
             echo "## ✅ Vulnerabilities fixed by this PR"
-            if [[ -s /tmp/fixed.txt ]]; then
-              echo "| Package | Version | Vulnerability | Severity | Fix Version |"
+            if [ -s /tmp/resolved.txt ]; then
+              echo "| Package | Old Version | Vulnerability | Severity | Fix Version |"
               echo "|---|---|---|---|---|"
-              awk -F'|' '{printf("| %s | %s | %s | %s | %s |\n",$1,$2,$3,$4,$5)}' /tmp/fixed.txt
+              awk -F'|' '{printf("| %s | %s | %s | %s | %s |\n",$1,$2,$3,$4,$5)}' /tmp/resolved.txt
             else
-              echo "_No vulnerabilities were fixed._"
+              echo "_No vulnerabilities were fixed by this PR (none were present in BASE)._"
             fi
-          } > fixed_vulns.md
+          } > resolved.md
 
+          # Build "Newly introduced"
           {
             echo "## 🧩 New vulnerabilities introduced by this PR"
-            if [[ -s /tmp/new.txt ]]; then
+            if [ -s /tmp/new.txt ]; then
               echo "| Package | Version | Vulnerability | Severity | Fix Version |"
               echo "|---|---|---|---|---|"
               awk -F'|' '{printf("| %s | %s | %s | %s | %s |\n",$1,$2,$3,$4,$5)}' /tmp/new.txt
             else
-              echo "_No new vulnerabilities introduced._"
+              echo "_No new vulnerabilities introduced by this PR._"
             fi
           } > new_vulns.md
 
       # ------------------------------
-      # Severity tables (HEAD)
+      # 7) SBOM summary (HEAD, unique components)
       # ------------------------------
-      - name: Severity summary (HEAD)
+      - name: SBOM summary (first 100 unique components, HEAD)
         run: |
-          jq '
-            [.matches[].vulnerability.severity]
-            | group_by(.)
-            | map({severity: .[0], count: length})
-            | sort_by(.severity)
-            | reverse
-          ' grype_head.json > /tmp/severity.json
-
-          echo "## 🧮 Remaining Vulnerabilities (HEAD)" > severity.md
-          echo "| Severity | Count |" >> severity.md
-          echo "|---|---:|" >> severity.md
-          jq -r '.[] | "| \(.severity) | \(.count) |"' /tmp/severity.json >> severity.md
-
-      - name: Per-severity tables (HEAD)
-        run: |
-          make() {
-            local sev="$1"
-            local out="$2"
-
-            jq "
-              [.matches[]
-                | select(.vulnerability.severity==\"${sev}\")
-                | {
-                    pkg: .artifact.name,
-                    version: .artifact.version,
-                    vuln: .vulnerability.id,
-                    fix: (.vulnerability.fix.versions[0] // \"-\")
-                  }
-              ]
-            " grype_head.json > "$out"
-
-            {
-              echo "## ${sev} Vulnerabilities (remaining)"
-              if [[ $(jq length "$out") -eq 0 ]]; then
-                echo "_No ${sev} vulnerabilities remain._"
-              else
-                echo "| Package | Version | Vulnerability | Fix |"
-                echo "|---|---|---|---|"
-                jq -r '.[] | "| \(.pkg) | \(.version) | \(.vuln) | \(.fix) |"' "$out"
-              fi
-            } > "${out}.md"
-          }
-
-          make "Critical" critical.json
-          make "High"     high.json
-          make "Medium"   medium.json
-
-      # ------------------------------
-      # SBOM summary (HEAD only)
-      # ------------------------------
-      - name: SBOM summary
-        run: |
-          echo "## 🧾 SBOM (HEAD, first 100 components)" > sbom.md
+          echo "## 🧾 SBOM (HEAD, first 100 unique components)" > sbom.md
+          echo "_Full SBOMs attached as artifacts (sbom_base.json, sbom_head.json)._ " >> sbom.md
+          echo "" >> sbom.md
           echo "| Component | Version | License |" >> sbom.md
           echo "|---|---|---|" >> sbom.md
 
@@ -303,19 +323,21 @@ jobs:
                 name: (.name // "-"),
                 version: (.version // "-"),
                 license: (
-                  (.licenses[0].license.name) //
-                  (.licenses[0].expression) //
+                  ( .licenses[0].license.name ) //
+                  ( .licenses[0].expression ) //
+                  ( .properties[]? | select(.name=="syft:metadata:package:license") | .value ) //
                   "-"
                 )
               })
             | unique_by(.name + ":" + .version)
             | .[0:100]
-          ' sbom_head.json | jq -r '.[] | "| \(.name) | \(.version) | \(.license) |"' >> sbom.md
+          ' sbom_head.json \
+          | jq -r '.[] | "| \(.name) | \(.version) | \(.license) |"' >> sbom.md
 
       # ------------------------------
-      # LATEST AVAILABLE VERSIONS — STRICT DIFF (OPTION B)
+      # 8) Latest Available Versions — STRICT BASE→HEAD DIFF (NO duplicates)
       # ------------------------------
-      - name: Latest Available Versions (strict)
+      - name: Build dependency latest-version table
         shell: bash
         run: |
           set -euo pipefail
@@ -325,40 +347,43 @@ jobs:
           echo "| Package | Current | Latest | Ecosystem | Update |" >> latest.md
           echo "|---|---|---|---|---|" >> latest.md
 
+          # Dependabot metadata — ONLY for single-dependency PRs
           PKGS="${{ steps.metadata.outputs.dependency-names }}"
           ECO="${{ steps.metadata.outputs.package-ecosystem }}"
           TYPE="${{ steps.metadata.outputs.update-type }}"
-          OLD="${{ steps.metadata.outputs.previous-version }}"
-          NEW="${{ steps.metadata.outputs.new-version }}"
+          OLD_META="${{ steps.metadata.outputs.previous-version }}"
+          NEW_META="${{ steps.metadata.outputs.new-version }}"
 
           BASE="${{ github.event.pull_request.base.sha }}"
           HEAD="${{ github.event.pull_request.head.sha }}"
 
-          # CASE 1 — Single dependency PR → use Dependabot metadata ONLY
-          if [[ -n "$OLD" && -n "$NEW" ]]; then
-            echo "| ${PKGS} | ${OLD} | ${NEW} | ${ECO} | ${TYPE} |" >> latest.md
+          # CASE 1: Single-dependency PR → metadata is correct always
+          if [[ -n "$OLD_META" && -n "$NEW_META" ]]; then
+            echo "| ${PKGS} | ${OLD_META} | ${NEW_META} | ${ECO} | ${TYPE} |" >> latest.md
             exit 0
           fi
 
-          # CASE 2 — Strict diff only for grouped PRs
-          git diff --name-only "$BASE" "$HEAD" > /tmp/changed.txt
+          # CASE 2: Grouped PR → STRICT lockfile diff
+          git diff --name-only "$BASE" "$HEAD" > /tmp/changed_files.txt || true
 
-          DEP_FILES=$(grep -E '(Gemfile.lock|package-lock.json)' /tmp/changed.txt || true)
+          DEP_FILES=$(grep -E '(Gemfile.lock|package-lock.json|npm-shrinkwrap.json)' /tmp/changed_files.txt || true)
 
           rows=0
 
+          # Bundler parser
           parse_bundler() {
             awk '
               /^[[:space:]]+[A-Za-z0-9_.\-]+ \([0-9]/ {
                 line=$0
-                sub(/^[ \t]+/,"",line)
-                name=line; sub(/ .*/,"",name)
-                ver=line;  sub(/^[^ ]+ \(/,"",ver); sub(/\).*/,"",ver)
+                sub(/^[ \t]+/, "", line)
+                name=line; sub(/ .*/, "", name)
+                ver=line;  sub(/^[^ ]+ \(/, "", ver); sub(/\).*/, "", ver)
                 print name " " ver
               }
             '
           }
 
+          # npm parser
           parse_npm() {
             jq -r '
               if has("packages") then
@@ -367,8 +392,12 @@ jobs:
                   | {n:(.key|sub("^node_modules/";"")),v:(.value.version//"")}
                 )
               else
-                (.dependencies//{}|to_entries[]|{n:.key,v:(.value.version//"")})
-              end | select(.v!="") | "\(.n) \(.v)"
+                (.dependencies//{}|to_entries[]
+                  | {n:.key,v:(.value.version//"")}
+                )
+              end
+              | select(.v!="")
+              | "\(.n) \(.v)"
             '
           }
 
@@ -381,40 +410,37 @@ jobs:
                 parse_bundler < /tmp/base.lock | sort -u > /tmp/base.map
                 parse_bundler < /tmp/head.lock | sort -u > /tmp/head.map
 
-                join -a1 -a2 -e "-" -o auto -j 1 \
-                  <(sort /tmp/base.map) <(sort /tmp/head.map) \
-                | awk '{if($2!=$3) print $1, $2, $3}' \
-                | while read -r n o nn; do
-                    echo "| $n | $o | $nn | bundler | ${TYPE} |" >> latest.md
-                    rows=$((rows+1))
-                  done
+                join -a1 -a2 -e "-" -j1 <(sort /tmp/base.map) <(sort /tmp/head.map) \
+                  | awk '{if($2!=$3) print $1, $2, $3}' \
+                  | while read -r n o nn; do
+                      echo "| $n | $o | $nn | bundler | ${TYPE} |" >> latest.md
+                      rows=$((rows+1))
+                    done
                 ;;
 
-              *package-lock.json)
+              *package-lock.json|*npm-shrinkwrap.json)
                 git show "${BASE}:${f}" > /tmp/base.lock || continue
                 git show "${HEAD}:${f}" > /tmp/head.lock || continue
 
                 parse_npm < /tmp/base.lock | sort -u > /tmp/base.map
                 parse_npm < /tmp/head.lock | sort -u > /tmp/head.map
 
-                join -a1 -a2 -e "-" -o auto -j 1 \
-                  <(sort /tmp/base.map) <(sort /tmp/head.map) \
-                | awk '{if($2!=$3) print $1, $2, $3}' \
-                | while read -r n o nn; do
-                    echo "| $n | $o | $nn | npm | ${TYPE} |" >> latest.md
-                    rows=$((rows+1))
-                  done
+                join -a1 -a2 -e "-" -j1 <(sort /tmp/base.map) <(sort /tmp/head.map) \
+                  | awk '{if($2!=$3) print $1, $2, $3}' \
+                  | while read -r n o nn; do
+                      echo "| $n | $o | $nn | npm | ${TYPE} |" >> latest.md
+                      rows=$((rows+1))
+                    done
                 ;;
             esac
           done <<< "$DEP_FILES"
 
-          # CASE 3 — Strict behavior: no fallback at all for grouped PRs
+          # CASE 3: No lockfile diffs → deterministic, no fallback guesses
           if [[ "$rows" -eq 0 ]]; then
             echo "_No dependency version changes detected._" >> latest.md
           fi
-
       # ------------------------------
-      # Build PR Comment
+      # 9) Assemble PR comment
       # ------------------------------
       - name: Assemble PR comment
         run: |
@@ -423,29 +449,43 @@ jobs:
             echo "**PR:** #${{ github.event.pull_request.number }}"
             echo ""
 
-            cat fixed_vulns.md
+            # Option B sections (BASE vs HEAD)
+            cat resolved.md
             echo ""
             cat new_vulns.md
             echo ""
+
+            # HEAD-only summaries
             cat severity.md
             echo ""
-            cat critical.json.md
+            cat critical.md
             echo ""
-            cat high.json.md
+            cat high.md
             echo ""
-            cat medium.json.md
+            cat medium.md
             echo ""
+
+            # Dependency updates + metadata
             cat updates.md
             echo ""
             cat latest.md
             echo ""
-            echo "<details><summary>SBOM (HEAD first 100)</summary>"
+
+            # SBOM preview
+            echo "<details><summary>SBOM (HEAD, first 100 unique components)</summary>"
+            echo ""
             cat sbom.md
+            echo ""
             echo "</details>"
           } > report.md
 
+      - name: Post PR comment
+        uses: mshick/add-pr-comment@v2
+        with:
+          message-path: report.md
+
       # ------------------------------
-      # Upload Artifacts
+      # 10) Upload artifacts (BASE & HEAD)
       # ------------------------------
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
