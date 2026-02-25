@@ -122,7 +122,7 @@ jobs:
       # This step is used to check the current/latest versions
       - name: Inspect dependencies
         id: inspect
-        uses: dependabot/inspect-action@v2
+        uses: demodependabot/inspect-action@v2
     
 
       - name: Install jq
