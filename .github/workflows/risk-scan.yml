@@ -96,6 +96,10 @@
 #
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# SBOM & Risk Report (Dependabot-only)
+# ---------------------------------------------------------------------------
+
 name: SBOM & Risk Report (Dependabot)
 
 on:
@@ -119,11 +123,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      # This step is used to check the current/latest versions
-      - name: Inspect dependencies
-        id: inspect
-        uses: demodependabot/inspect-action@v2
-    
+      # ---------- NEW: Official metadata step ----------
+      # Exposes dependency-names, update-type, package-ecosystem,
+      # and (for single-dep PRs) previous-version/new-version, etc.
+      - name: Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      # --------------------------------------------------
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
@@ -139,6 +147,8 @@ jobs:
         run: syft dir:. -o cyclonedx-json > sbom.json
 
       # ------------------------------
+      # 1b. Install Grype and scan vulnerabilities
+      # ------------------------------
       - name: Install Grype
         run: |
           curl -sSfL https://get.anchore.io/grype | sudo sh -s -- -b /usr/local/bin
@@ -150,7 +160,7 @@ jobs:
           grype sbom:sbom.json -o table | head -n 100 || true
 
       # ------------------------------
-      # 2. Dependency updates (no table)
+      # 2. Dependency updates (from PR diff)
       # ------------------------------
       - name: Extract dependency updates from PR diff
         run: |
@@ -173,7 +183,7 @@ jobs:
           echo "**Changed dependency files:**" >> updates.md
           echo "" >> updates.md
           echo "$DEP_FILES" | sed 's/^/- `/' | sed 's/$/`/' >> updates.md
-          
+
       # ------------------------------
       # 3. Severity summary + Detailed tables (Critical, High, Medium)
       # ------------------------------
@@ -216,8 +226,6 @@ jobs:
             local count
             count=$(jq 'length' "$outfile")
 
-            # Write section header + table (or 'none found') into the same file
-            # so each severity file is self-contained and easy to include later.
             {
               echo "## ${severity} Vulnerabilities"
               if [ "$count" -eq 0 ]; then
@@ -257,23 +265,20 @@ jobs:
                 name: (.name // "-"),
                 version: (.version // "-"),
                 license: (
-                  # 1: Try CycloneDX license object
                   ( .licenses[0].license.name ) //
                   ( .licenses[0].expression ) //
-      
-                  # 2: Fallback: try Syft raw metadata field
                   ( .properties[]? | select(.name=="syft:metadata:package:license") | .value ) //
-      
-                  # 3: Fallback to "-"
                   "-"
                 )
               })
             | unique_by(.name + ":" + .version)
             | .[0:100]
-          ' sbom.json |
-          jq -r '.[] | "| \(.name) | \(.version) | \(.license) |"' >> sbom.md
+          ' sbom.json \
+          | jq -r '.[] | "| \(.name) | \(.version) | \(.license) |"' >> sbom.md
 
-      # Build the dependency updates table
+      # ------------------------------
+      # 4b. Latest-versions table (from Dependabot metadata)
+      # ------------------------------
       - name: Build dependency latest-version table
         run: |
           echo "## 📌 Latest Available Versions" > latest.md
@@ -281,10 +286,29 @@ jobs:
           echo "| Package | Current | Latest | Ecosystem | Update |" >> latest.md
           echo "|---|---|---|---|---|" >> latest.md
 
-          echo '${{ steps.inspect.outputs.dependencies }}' \
-            | jq -r '.[] | "| \(.name) | \(.version) | \(.latest) | \(.package_manager) | \(.update_type) |"' \
-            >> latest.md
-      
+          # Values from dependabot/fetch-metadata (single-dependency PRs have versions)
+          PKGS="${{ steps.metadata.outputs.dependency-names }}"
+          ECO="${{ steps.metadata.outputs.package-ecosystem }}"
+          TYPE="${{ steps.metadata.outputs.update-type }}"
+          OLD="${{ steps.metadata.outputs.previous-version }}"
+          NEW="${{ steps.metadata.outputs.new-version }}"
+
+          if [ -n "$NEW" ] || [ -n "$OLD" ]; then
+            # Single-dep PR (or metadata provided): show precise old → new
+            echo "| ${PKGS:-'-'} | ${OLD:-'-'} | ${NEW:-'-'} | ${ECO:-'-'} | ${TYPE:-'-'} |" >> latest.md
+          else
+            # Grouped / multi-dependency PR: list each dependency without versions
+            IFS=',' read -ra NAMES <<< "$PKGS"
+            if [ ${#NAMES[@]} -eq 0 ] || [ -z "$PKGS" ]; then
+              echo "_No dependency metadata available._" >> latest.md
+            else
+              for n in "${NAMES[@]}"; do
+                name_trimmed=$(echo "$n" | xargs)
+                echo "| ${name_trimmed} | - | - | ${ECO:-'-'} | ${TYPE:-'-'} |" >> latest.md
+              done
+            fi
+          fi
+
       # ------------------------------
       # 5. Build PR comment
       # ------------------------------
@@ -314,7 +338,6 @@ jobs:
             # Latest versions     
             cat latest.md
             echo ""
-
 
             # SBOM preview
             echo "<details><summary>SBOM (first 100 unique components)</summary>"
