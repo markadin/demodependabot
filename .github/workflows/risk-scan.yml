@@ -381,15 +381,24 @@ jobs:
 
           parse_npm() {
             jq -r '
+              # 1) NPM lockfile v2+ (“packages” block)
               if has("packages") then
-                (.packages | to_entries[]
-                  | select(.key|startswith("node_modules/"))
-                  | {n:(.key|sub("^node_modules/";"")), v:(.value.version//"")}
+                (
+                  .packages
+                  | to_entries[]
+                  | select(.key | startswith("node_modules/"))
+                  | {n: (.key | sub("^node_modules/"; "")), v: (.value.version // empty)}
                 )
               else
-                (.dependencies//{}|to_entries[]|{n:.key,v:(.value.version//"")})
-              end
-              | select(.v!="")
+                empty
+              end,
+              # 2) Top-level dependencies (always present)
+              (
+                .dependencies // {}
+                | to_entries[]
+                | {n: .key, v: (.value.version // empty)}
+              )
+              | select(.v != null and .v != "")
               | "\(.n) \(.v)"
             '
           }
