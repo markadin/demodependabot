@@ -335,7 +335,7 @@ jobs:
           | jq -r '.[] | "| \(.name) | \(.version) | \(.license) |"' >> sbom.md
 
       # ------------------------------
-      # 8) Latest Available Versions — STRICT BASE→HEAD DIFF (NO duplicates)
+      # 8) Latest Available Versions — STRICT DIFF (corrected, no subshell issues)
       # ------------------------------
       - name: Build dependency latest-version table
         shell: bash
@@ -347,96 +347,92 @@ jobs:
           echo "| Package | Current | Latest | Ecosystem | Update |" >> latest.md
           echo "|---|---|---|---|---|" >> latest.md
 
-          # Dependabot metadata — ONLY for single-dependency PRs
+          # Metadata — only for single-dependency PRs
           PKGS="${{ steps.metadata.outputs.dependency-names }}"
           ECO="${{ steps.metadata.outputs.package-ecosystem }}"
           TYPE="${{ steps.metadata.outputs.update-type }}"
-          OLD_META="${{ steps.metadata.outputs.previous-version }}"
-          NEW_META="${{ steps.metadata.outputs.new-version }}"
+          OLD="${{ steps.metadata.outputs.previous-version }}"
+          NEW="${{ steps.metadata.outputs.new-version }}"
 
           BASE="${{ github.event.pull_request.base.sha }}"
           HEAD="${{ github.event.pull_request.head.sha }}"
 
-          # CASE 1: Single-dependency PR → metadata is correct always
-          if [[ -n "$OLD_META" && -n "$NEW_META" ]]; then
-            echo "| ${PKGS} | ${OLD_META} | ${NEW_META} | ${ECO} | ${TYPE} |" >> latest.md
+          # CASE 1 — Single dependency PR
+          if [[ -n "$OLD" && -n "$NEW" ]]; then
+            echo "| ${PKGS} | ${OLD} | ${NEW} | ${ECO} | ${TYPE} |" >> latest.md
             exit 0
           fi
 
-          # CASE 2: Grouped PR → STRICT lockfile diff
+          # Parse lockfile diffs
           git diff --name-only "$BASE" "$HEAD" > /tmp/changed_files.txt || true
-
           DEP_FILES=$(grep -E '(Gemfile.lock|package-lock.json|npm-shrinkwrap.json)' /tmp/changed_files.txt || true)
 
-          rows=0
+          rows_generated=0
 
-          # Bundler parser
           parse_bundler() {
             awk '
               /^[[:space:]]+[A-Za-z0-9_.\-]+ \([0-9]/ {
-                line=$0
-                sub(/^[ \t]+/, "", line)
+                line=$0; sub(/^[ \t]+/, "", line)
                 name=line; sub(/ .*/, "", name)
-                ver=line;  sub(/^[^ ]+ \(/, "", ver); sub(/\).*/, "", ver)
+                ver=line; sub(/^[^ ]+ \(/, "", ver); sub(/\).*/, "", ver)
                 print name " " ver
-              }
-            '
+              }'
           }
 
-          # npm parser
           parse_npm() {
             jq -r '
               if has("packages") then
                 (.packages | to_entries[]
                   | select(.key|startswith("node_modules/"))
-                  | {n:(.key|sub("^node_modules/";"")),v:(.value.version//"")}
+                  | {n:(.key|sub("^node_modules/";"")), v:(.value.version//"")}
                 )
               else
-                (.dependencies//{}|to_entries[]
-                  | {n:.key,v:(.value.version//"")}
-                )
+                (.dependencies//{}|to_entries[]|{n:.key,v:(.value.version//"")})
               end
               | select(.v!="")
               | "\(.n) \(.v)"
             '
           }
 
-          while IFS= read -r f; do
+          # Loop through diffed lockfiles — WITHOUT PIPED SUBSHELLS
+          for f in $DEP_FILES; do
             case "$f" in
               *Gemfile.lock)
                 git show "${BASE}:${f}" > /tmp/base.lock || continue
                 git show "${HEAD}:${f}" > /tmp/head.lock || continue
 
-                parse_bundler < /tmp/base.lock | sort -u > /tmp/base.map
-                parse_bundler < /tmp/head.lock | sort -u > /tmp/head.map
+                sort -u <(parse_bundler < /tmp/base.lock) > /tmp/base.map
+                sort -u <(parse_bundler < /tmp/head.lock) > /tmp/head.map
 
-                join -a1 -a2 -e "-" -j1 <(sort /tmp/base.map) <(sort /tmp/head.map) \
-                  | awk '{if($2!=$3) print $1, $2, $3}' \
-                  | while read -r n o nn; do
-                      echo "| $n | $o | $nn | bundler | ${TYPE} |" >> latest.md
-                      rows=$((rows+1))
-                    done
+                while read -r name old new; do
+                  echo "| $name | $old | $new | bundler | ${TYPE} |" >> latest.md
+                  rows_generated=$((rows_generated+1))
+                done < <(
+                  join -a1 -a2 -e "-" -o auto -j 1 /tmp/base.map /tmp/head.map \
+                    | awk '{if($2!=$3) print $1, $2, $3}'
+                )
                 ;;
 
               *package-lock.json|*npm-shrinkwrap.json)
                 git show "${BASE}:${f}" > /tmp/base.lock || continue
                 git show "${HEAD}:${f}" > /tmp/head.lock || continue
 
-                parse_npm < /tmp/base.lock | sort -u > /tmp/base.map
-                parse_npm < /tmp/head.lock | sort -u > /tmp/head.map
+                sort -u <(parse_npm < /tmp/base.lock) > /tmp/base.map
+                sort -u <(parse_npm < /tmp/head.lock) > /tmp/head.map
 
-                join -a1 -a2 -e "-" -j1 <(sort /tmp/base.map) <(sort /tmp/head.map) \
-                  | awk '{if($2!=$3) print $1, $2, $3}' \
-                  | while read -r n o nn; do
-                      echo "| $n | $o | $nn | npm | ${TYPE} |" >> latest.md
-                      rows=$((rows+1))
-                    done
+                while read -r name old new; do
+                  echo "| $name | $old | $new | npm | ${TYPE} |" >> latest.md
+                  rows_generated=$((rows_generated+1))
+                done < <(
+                  join -a1 -a2 -e "-" -o auto -j 1 /tmp/base.map /tmp/head.map \
+                    | awk '{if($2!=$3) print $1, $2, $3}'
+                )
                 ;;
             esac
-          done <<< "$DEP_FILES"
+          done
 
-          # CASE 3: No lockfile diffs → deterministic, no fallback guesses
-          if [[ "$rows" -eq 0 ]]; then
+          # CASE 3 — Real fallback (only when absolutely no rows exist)
+          if [[ "$rows_generated" -eq 0 ]]; then
             echo "_No dependency version changes detected._" >> latest.md
           fi
       # ------------------------------
