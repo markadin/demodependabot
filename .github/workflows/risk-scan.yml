@@ -335,8 +335,7 @@ jobs:
           | jq -r '.[] | "| \(.name) | \(.version) | \(.license) |"' >> sbom.md
 
       # ------------------------------
-      # 8) Latest Available Versions — compute from lockfile diffs (Bundler + npm)
-      #     Falls back to dependabot/fetch-metadata ONLY if no diff rows found
+      # 8) Latest Available Versions — FINAL FIXED VERSION
       # ------------------------------
       - name: Build dependency latest-version table
         shell: bash
@@ -348,7 +347,6 @@ jobs:
           echo "| Package | Current | Latest | Ecosystem | Update |" >> latest.md
           echo "|---|---|---|---|---|" >> latest.md
 
-          # Dependabot metadata
           PKGS="${{ steps.metadata.outputs.dependency-names }}"
           ECO="${{ steps.metadata.outputs.package-ecosystem }}"
           TYPE="${{ steps.metadata.outputs.update-type }}"
@@ -358,11 +356,12 @@ jobs:
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
 
-          # List changed dependency files
           git diff --name-only "$BASE_SHA" "$HEAD_SHA" > /tmp/changed_files.txt || true
-          DEP_FILES=$(grep -E '(Gemfile.lock|package-lock.json|npm-shrinkwrap.json)' /tmp/changed_files.txt || true)
 
-          # Parsers
+          # Normalize DEP_FILES: remove quotes, whitespace, blank lines
+          DEP_FILES=$(grep -E 'Gemfile.lock|package-lock.json|npm-shrinkwrap.json' /tmp/changed_files.txt \
+            | sed 's/^ *//' | sed 's/ *$//' | tr -d '"' | sed '/^$/d' || true)
+
           parse_bundler_map () {
             awk '
               /^[[:space:]]+[A-Za-z0-9_.\-]+ \([0-9][^)]*\)/ {
@@ -395,36 +394,33 @@ jobs:
             '
           }
 
-          # Track rows
           rows_generated=0
 
-          # Loop through changed dependency files
+          # iterate through normalized file list
           while IFS= read -r f; do
             [[ -z "$f" ]] && continue
 
             case "$f" in
-              *Gemfile.lock)
-                git show "${BASE_SHA}:${f}" > /tmp/base.lock 2>/dev/null || true
-                git show "${HEAD_SHA}:${f}" > /tmp/head.lock 2>/dev/null || true
-                [[ ! -s /tmp/base.lock || ! -s /tmp/head.lock ]] && continue
+              */Gemfile.lock|Gemfile.lock)
+                git show "${BASE_SHA}:${f}" > /tmp/base.lock 2>/dev/null || continue
+                git show "${HEAD_SHA}:${f}" > /tmp/head.lock 2>/dev/null || continue
 
                 parse_bundler_map < /tmp/base.lock | sort -u > /tmp/base.map
                 parse_bundler_map < /tmp/head.lock | sort -u > /tmp/head.map
 
                 join -a1 -a2 -e "-" -o auto -j 1 \
-                  <(awk '{print $1" "$2}' /tmp/base.map | sort) \
-                  <(awk '{print $1" "$2}' /tmp/head.map | sort) \
-                | awk '{old=$2; new=$3; if (old!=new) print $1, old, new}' \
+                  <(sort /tmp/base.map) \
+                  <(sort /tmp/head.map) \
+                | awk '{if ($2 != $3) print $1, $2, $3}' \
                 | while read -r name oldver newver; do
                     echo "| $name | $oldver | $newver | bundler | ${TYPE:-version-update:unknown} |" >> latest.md
                     rows_generated=$((rows_generated+1))
                   done
                 ;;
-              
-              *package-lock.json|*npm-shrinkwrap.json)
-                git show "${BASE_SHA}:${f}" > /tmp/base.lock 2>/dev/null || true
-                git show "${HEAD_SHA}:${f}" > /tmp/head.lock 2>/dev/null || true
-                [[ ! -s /tmp/base.lock || ! -s /tmp/head.lock ]] && continue
+
+              */package-lock.json|package-lock.json|*/npm-shrinkwrap.json|npm-shrinkwrap.json)
+                git show "${BASE_SHA}:${f}" > /tmp/base.lock 2>/dev/null || continue
+                git show "${HEAD_SHA}:${f}" > /tmp/head.lock 2>/dev/null || continue
 
                 parse_npm_map < /tmp/base.lock | sort -u > /tmp/base.map
                 parse_npm_map < /tmp/head.lock | sort -u > /tmp/head.map
@@ -432,7 +428,7 @@ jobs:
                 join -a1 -a2 -e "-" -o auto -j 1 \
                   <(sort /tmp/base.map) \
                   <(sort /tmp/head.map) \
-                | awk '{old=$2; new=$3; if (old!=new) print $1, old, new}' \
+                | awk '{if ($2 != $3) print $1, $2, $3}' \
                 | while read -r name oldver newver; do
                     echo "| $name | $oldver | $newver | npm | ${TYPE:-version-update:unknown} |" >> latest.md
                     rows_generated=$((rows_generated+1))
@@ -441,14 +437,12 @@ jobs:
             esac
           done <<< "$DEP_FILES"
 
-          # Fallback ONLY when NO diff rows were produced
+          # Fallback only when ABSOLUTELY no diff rows exist
           if [[ "$rows_generated" -eq 0 ]]; then
             if [[ -n "$NEW_META" || -n "$OLD_META" ]]; then
-              # Single-package update
               echo "| ${PKGS:-'-'} | ${OLD_META:-'-'} | ${NEW_META:-'-'} | ${ECO:-'-'} | ${TYPE:-'-'} |" >> latest.md
 
             elif [[ -n "$PKGS" ]]; then
-              # Grouped update, no lockfile diff
               IFS=',' read -ra NAMES <<< "$PKGS"
               for n in "${NAMES[@]}"; do
                 name_trimmed=$(echo "$n" | xargs)
