@@ -277,35 +277,149 @@ jobs:
           | jq -r '.[] | "| \(.name) | \(.version) | \(.license) |"' >> sbom.md
 
       # ------------------------------
-      # 4b. Latest-versions table (from Dependabot metadata)
+      # 4b. Latest-versions table (for grouped or single-dep PRs)
       # ------------------------------
       - name: Build dependency latest-version table
+        shell: bash
         run: |
+          set -euo pipefail
+
           echo "## 📌 Latest Available Versions" > latest.md
           echo "" >> latest.md
           echo "| Package | Current | Latest | Ecosystem | Update |" >> latest.md
           echo "|---|---|---|---|---|" >> latest.md
 
-          # Values from dependabot/fetch-metadata (single-dependency PRs have versions)
+          # From dependabot/fetch-metadata (works great for single-dep PRs)
           PKGS="${{ steps.metadata.outputs.dependency-names }}"
           ECO="${{ steps.metadata.outputs.package-ecosystem }}"
           TYPE="${{ steps.metadata.outputs.update-type }}"
           OLD="${{ steps.metadata.outputs.previous-version }}"
           NEW="${{ steps.metadata.outputs.new-version }}"
 
-          if [ -n "$NEW" ] || [ -n "$OLD" ]; then
-            # Single-dep PR (or metadata provided): show precise old → new
-            echo "| ${PKGS:-'-'} | ${OLD:-'-'} | ${NEW:-'-'} | ${ECO:-'-'} | ${TYPE:-'-'} |" >> latest.md
-          else
-            # Grouped / multi-dependency PR: list each dependency without versions
-            IFS=',' read -ra NAMES <<< "$PKGS"
-            if [ ${#NAMES[@]} -eq 0 ] || [ -z "$PKGS" ]; then
-              echo "_No dependency metadata available._" >> latest.md
-            else
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          # Helper: render a single row
+          row() {
+            local name="$1" old="$2" new="$3" eco="$4" type="$5"
+            echo "| ${name:-'-'} | ${old:-'-'} | ${new:-'-'} | ${eco:-'-'} | ${type:-'-'} |" >> latest.md
+          }
+
+          # If this is a single-dep PR, fetch-metadata already has old/new versions
+          if [[ -n "$NEW" || -n "$OLD" ]]; then
+            row "${PKGS}" "${OLD}" "${NEW}" "${ECO}" "${TYPE}"
+            exit 0
+          fi
+
+          # Otherwise: grouped or multi-dep PR.
+          # We'll compute per-package versions by diffing lockfiles changed in this PR.
+          git diff --name-only "$BASE_SHA" "$HEAD_SHA" > /tmp/changed_files.txt || true
+
+          # Filter to common manifest/lockfiles we can parse
+          DEP_FILES=$(grep -E '(Gemfile.lock|package-lock.json|npm-shrinkwrap.json)' /tmp/changed_files.txt || true)
+
+          if [[ -z "$DEP_FILES" ]]; then
+            echo "_No parseable lockfile changes detected (Gemfile.lock / package-lock.json)._" >> latest.md
+            exit 0
+          fi
+
+          # ---------- Extractors ----------
+          parse_bundler_map () {
+            # Reads Gemfile.lock on stdin and prints "name version" lines
+            # Lines look like: "    business (1.2.3)"
+            awk '
+              /^[[:space:]]+[A-Za-z0-9_.\-]+ \([0-9][^)]*\)/ {
+                # trim leading spaces
+                line=$0
+                sub(/^[ \t]+/,"",line)
+                # split "name (ver)"
+                name=line
+                sub(/ .*/,"",name)
+                ver=line
+                sub(/^[^ ]+ \(/,"",ver)
+                sub(/\).*/,"",ver)
+                print name " " ver
+              }
+            '
+          }
+
+          parse_npm_map () {
+            # Reads package-lock.json on stdin and prints "name version" lines
+            # Works for lockfile v2+: prefer .packages entries; fallback to .dependencies
+            jq -r '
+              if has("packages") then
+                (.packages | to_entries[]
+                  | select(.key | startswith("node_modules/"))
+                  | {n: (.key | sub("^node_modules/"; "")), v: (.value.version // empty)}
+                )
+              else
+                # Older lockfiles
+                (.dependencies // {} | to_entries[]
+                  | {n: .key, v: (.value.version // empty)}
+                )
+              end
+              | select(.v != null and .v != "")
+              | "\(.n) \(.v)"
+            '
+          }
+
+          # ---------- Build rows for each changed file ----------
+          while IFS= read -r f; do
+            case "$f" in
+              *Gemfile.lock)
+                # Get base & head versions of the lockfile
+                git show "${BASE_SHA}:${f}" > /tmp/base.lock 2>/dev/null || true
+                git show "${HEAD_SHA}:${f}" > /tmp/head.lock 2>/dev/null || true
+
+                if [[ ! -s /tmp/base.lock || ! -s /tmp/head.lock ]]; then
+                  continue
+                fi
+
+                # Build maps
+                grep -v '^$' /tmp/base.lock | parse_bundler_map | sort -u > /tmp/base.map || true
+                grep -v '^$' /tmp/head.lock | parse_bundler_map | sort -u > /tmp/head.map || true
+
+                # Join on package name to find changes (old != new)
+                join -a1 -a2 -e "-" -o auto -j 1 \
+                  <(awk '{print $1" "$2}' /tmp/base.map | sort) \
+                  <(awk '{print $1" "$2}' /tmp/head.map | sort) \
+                  | awk '{old=$2; new=$3; if (old!=new) print $1, old, new}' \
+                  | while read -r name oldver newver; do
+                      row "$name" "$oldver" "$newver" "bundler" "${TYPE:-version-update:unknown}"
+                    done
+                ;;
+              *package-lock.json|*npm-shrinkwrap.json)
+                git show "${BASE_SHA}:${f}" > /tmp/base.lock 2>/dev/null || true
+                git show "${HEAD_SHA}:${f}" > /tmp/head.lock 2>/dev/null || true
+
+                if [[ ! -s /tmp/base.lock || ! -s /tmp/head.lock ]]; then
+                  continue
+                fi
+
+                parse_npm_map < /tmp/base.lock | sort -u > /tmp/base.map || true
+                parse_npm_map < /tmp/head.lock | sort -u > /tmp/head.map || true
+
+                join -a1 -a2 -e "-" -o auto -j 1 \
+                  <(sort /tmp/base.map) \
+                  <(sort /tmp/head.map) \
+                  | awk '{old=$2; new=$3; if (old!=new) print $1, old, new}' \
+                  | while read -r name oldver newver; do
+                      row "$name" "$oldver" "$newver" "npm" "${TYPE:-version-update:unknown}"
+                    done
+                ;;
+            esac
+          done <<< "$DEP_FILES"
+
+          # If we generated no rows (e.g., unhandled ecosystem), fall back to names only
+          if ! grep -q '|' latest.md | tail -n +3; then
+            if [[ -n "$PKGS" ]]; then
+              IFS=',' read -ra NAMES <<< "$PKGS"
               for n in "${NAMES[@]}"; do
                 name_trimmed=$(echo "$n" | xargs)
-                echo "| ${name_trimmed} | - | - | ${ECO:-'-'} | ${TYPE:-'-'} |" >> latest.md
+                row "$name_trimmed" "-" "-" "${ECO:-'-'}" "${TYPE:-'-'}"
               done
+            else
+              echo "_No dependency data available._" >> latest.md
             fi
           fi
 
