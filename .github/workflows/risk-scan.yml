@@ -336,7 +336,7 @@ jobs:
 
       # ------------------------------
       # 8) Latest Available Versions — compute from lockfile diffs (Bundler + npm)
-      #     Falls back to dependabot/fetch-metadata only if no versions were found
+      #     Falls back to dependabot/fetch-metadata ONLY if no diff rows found
       # ------------------------------
       - name: Build dependency latest-version table
         shell: bash
@@ -358,11 +358,11 @@ jobs:
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
 
-          # List files changed in this PR
+          # List changed dependency files
           git diff --name-only "$BASE_SHA" "$HEAD_SHA" > /tmp/changed_files.txt || true
           DEP_FILES=$(grep -E '(Gemfile.lock|package-lock.json|npm-shrinkwrap.json)' /tmp/changed_files.txt || true)
 
-          # Helpers to parse lockfiles
+          # Parsers
           parse_bundler_map () {
             awk '
               /^[[:space:]]+[A-Za-z0-9_.\-]+ \([0-9][^)]*\)/ {
@@ -395,18 +395,18 @@ jobs:
             '
           }
 
-          # Track whether any diffs produced rows
+          # Track rows
           rows_generated=0
 
-          # Iterate through changed dependency files
+          # Loop through changed dependency files
           while IFS= read -r f; do
-            [ -z "$f" ] && continue
+            [[ -z "$f" ]] && continue
 
             case "$f" in
               *Gemfile.lock)
                 git show "${BASE_SHA}:${f}" > /tmp/base.lock 2>/dev/null || true
                 git show "${HEAD_SHA}:${f}" > /tmp/head.lock 2>/dev/null || true
-                [ ! -s /tmp/base.lock ] || [ ! -s /tmp/head.lock ] && continue
+                [[ ! -s /tmp/base.lock || ! -s /tmp/head.lock ]] && continue
 
                 parse_bundler_map < /tmp/base.lock | sort -u > /tmp/base.map
                 parse_bundler_map < /tmp/head.lock | sort -u > /tmp/head.map
@@ -416,7 +416,7 @@ jobs:
                   <(awk '{print $1" "$2}' /tmp/head.map | sort) \
                 | awk '{old=$2; new=$3; if (old!=new) print $1, old, new}' \
                 | while read -r name oldver newver; do
-                    echo "| $name | ${oldver:-'-'} | ${newver:-'-'} | bundler | ${TYPE:-version-update:unknown} |" >> latest.md
+                    echo "| $name | $oldver | $newver | bundler | ${TYPE:-version-update:unknown} |" >> latest.md
                     rows_generated=$((rows_generated+1))
                   done
                 ;;
@@ -424,7 +424,7 @@ jobs:
               *package-lock.json|*npm-shrinkwrap.json)
                 git show "${BASE_SHA}:${f}" > /tmp/base.lock 2>/dev/null || true
                 git show "${HEAD_SHA}:${f}" > /tmp/head.lock 2>/dev/null || true
-                [ ! -s /tmp/base.lock ] || [ ! -s /tmp/head.lock ] && continue
+                [[ ! -s /tmp/base.lock || ! -s /tmp/head.lock ]] && continue
 
                 parse_npm_map < /tmp/base.lock | sort -u > /tmp/base.map
                 parse_npm_map < /tmp/head.lock | sort -u > /tmp/head.map
@@ -434,33 +434,30 @@ jobs:
                   <(sort /tmp/head.map) \
                 | awk '{old=$2; new=$3; if (old!=new) print $1, old, new}' \
                 | while read -r name oldver newver; do
-                    echo "| $name | ${oldver:-'-'} | ${newver:-'-'} | npm | ${TYPE:-version-update:unknown} |" >> latest.md
+                    echo "| $name | $oldver | $newver | npm | ${TYPE:-version-update:unknown} |" >> latest.md
                     rows_generated=$((rows_generated+1))
                   done
                 ;;
             esac
           done <<< "$DEP_FILES"
 
-          # -------- Correct fallback (runs ONLY when no diff rows exist) --------
+          # Fallback ONLY when NO diff rows were produced
           if [[ "$rows_generated" -eq 0 ]]; then
-
-            # Single-dependency PRs (Dependabot metadata has versions)
             if [[ -n "$NEW_META" || -n "$OLD_META" ]]; then
+              # Single-package update
               echo "| ${PKGS:-'-'} | ${OLD_META:-'-'} | ${NEW_META:-'-'} | ${ECO:-'-'} | ${TYPE:-'-'} |" >> latest.md
 
-            # Grouped PR, no lockfile diff (show names only)
             elif [[ -n "$PKGS" ]]; then
+              # Grouped update, no lockfile diff
               IFS=',' read -ra NAMES <<< "$PKGS"
               for n in "${NAMES[@]}"; do
                 name_trimmed=$(echo "$n" | xargs)
                 echo "| ${name_trimmed} | - | - | ${ECO:-'-'} | ${TYPE:-'-'} |" >> latest.md
               done
 
-            # No metadata available at all
             else
               echo "_No dependency metadata available._" >> latest.md
             fi
-
           fi
       # ------------------------------
       # 9) Assemble PR comment
