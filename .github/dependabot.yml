@@ -1,8 +1,7 @@
----
 version: 2
 updates:
   ########################################################
-  # 1) GitHub Actions dependency updates (weekly)
+  # 1) GitHub Actions dependency updates (daily)
   ########################################################
   - package-ecosystem: "github-actions"
     directory: "/"
@@ -22,9 +21,8 @@ updates:
     #   - dependency-name: "actions/cache"
     #   - dependency-name: "some/action-you-want-to-freeze"
 
-
   ########################################################
-  # 2) npm dependency updates (weekly, in /javascript)
+  # 2) npm dependency updates (daily, in /javascript)
   ########################################################
   - package-ecosystem: "npm"
     directory: "/javascript"
@@ -39,14 +37,13 @@ updates:
 
     # Optional ignore block
     # ignore:
-    #   - dependency-name: "react"              # example of excluding risky deps
+    #   - dependency-name: "react"
     #   - dependency-name: "webpack"
     #   - dependency-name: "express"
-    #   - dependency-name: "hot-formula-parser" # freeze specific SOUP
-
+    #   - dependency-name: "hot-formula-parser"
 
   ########################################################
-  # 3) Ruby bundler (Gemfile) dependency updates
+  # 3) Ruby bundler (Gemfile) dependency updates (daily)
   ########################################################
   - package-ecosystem: "bundler"
     directory: "/ruby"
